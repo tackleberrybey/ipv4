@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #############################################
-# Elite Proxy Setup Script v1.0
+# Elite Proxy Setup Script v1.1 FINAL
 # Sets up HTTP + SOCKS5 Anonymous Proxies
 # Using 3proxy on Ubuntu/Debian
 #############################################
@@ -34,7 +34,7 @@ WORK_DIR="/root/3proxy-install"
 print_header() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v1.0${NC}    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v1.1${NC}    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   HTTP + SOCKS5 Anonymous Proxy   ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════╝${NC}"
     echo ""
@@ -60,7 +60,6 @@ print_info() {
     echo -e "${CYAN}ℹ${NC} $1"
 }
 
-# Error handler
 error_exit() {
     print_error "$1"
     echo ""
@@ -69,7 +68,6 @@ error_exit() {
     exit 1
 }
 
-# Cleanup function
 cleanup() {
     if [ -d "$WORK_DIR" ]; then
         rm -rf "$WORK_DIR"
@@ -114,28 +112,23 @@ check_internet() {
 check_existing_installation() {
     echo -n "Checking for existing installation... "
     
-    # Check if 3proxy service exists and is running
     if systemctl list-units --full -all | grep -q "3proxy.service"; then
         print_warning "Existing 3proxy installation detected"
         
-        # Stop the service
         echo -n "Stopping existing 3proxy service... "
         systemctl stop 3proxy > /dev/null 2>&1
         sleep 2
         print_success "Service stopped"
         
-        # Disable the service
         echo -n "Disabling existing service... "
         systemctl disable 3proxy > /dev/null 2>&1
         print_success "Service disabled"
         
-        # Kill any remaining processes
         echo -n "Killing any remaining 3proxy processes... "
         pkill -9 3proxy > /dev/null 2>&1
         sleep 1
         print_success "Processes terminated"
         
-        # Remove old installation
         echo -n "Removing old installation... "
         rm -rf "$PROXY_DIR" > /dev/null 2>&1
         rm -f /etc/systemd/system/3proxy.service > /dev/null 2>&1
@@ -158,7 +151,6 @@ get_user_input() {
     print_separator
     echo ""
 
-    # Username
     while true; do
         read -p "Enter proxy username: " PROXY_USER
         if [ -z "$PROXY_USER" ]; then
@@ -168,7 +160,6 @@ get_user_input() {
         fi
     done
 
-    # Password
     while true; do
         read -s -p "Enter proxy password: " PROXY_PASS
         echo ""
@@ -185,15 +176,12 @@ get_user_input() {
         fi
     done
 
-    # HTTP Port
     read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
     HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
 
-    # SOCKS5 Port
     read -p "SOCKS5 port [$DEFAULT_SOCKS_PORT]: " SOCKS_PORT
     SOCKS_PORT=${SOCKS_PORT:-$DEFAULT_SOCKS_PORT}
 
-    # Validate ports
     if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
         error_exit "Invalid HTTP port. Must be between 1024-65535"
     fi
@@ -216,11 +204,9 @@ get_user_input() {
 detect_ip() {
     print_separator
     
-    # Try multiple methods to get public IP
     SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null || curl -s -4 icanhazip.com 2>/dev/null || curl -s -4 ipinfo.io/ip 2>/dev/null)
     
     if [ -z "$SERVER_IP" ]; then
-        # Fallback to local IP
         SERVER_IP=$(hostname -I | awk '{print $1}')
     fi
 
@@ -266,7 +252,6 @@ install_dependencies() {
     print_separator
     echo ""
 
-    # Update system
     echo -n "Updating package lists... "
     if apt-get update -qq > /dev/null 2>&1; then
         print_success "System updated"
@@ -274,11 +259,10 @@ install_dependencies() {
         error_exit "Failed to update system"
     fi
 
-    # Install required packages
-    PACKAGES="build-essential gcc g++ make curl wget git ufw fail2ban"
+    PACKAGES="build-essential gcc g++ make curl wget git ufw fail2ban libevent-dev"
     
     echo -n "Installing build tools... "
-    if apt-get install -y -qq $PACKAGES > /dev/null 2>&1; then
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $PACKAGES > /dev/null 2>&1; then
         print_success "Build tools installed"
     else
         error_exit "Failed to install dependencies"
@@ -297,11 +281,9 @@ install_3proxy() {
     print_separator
     echo ""
 
-    # Create working directory
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR" || error_exit "Failed to create working directory"
 
-    # Download 3proxy
     echo -n "Downloading 3proxy... "
     PROXY_VERSION="0.9.4"
     if wget -q "https://github.com/3proxy/3proxy/archive/${PROXY_VERSION}.tar.gz" -O 3proxy.tar.gz; then
@@ -310,7 +292,6 @@ install_3proxy() {
         error_exit "Failed to download 3proxy"
     fi
 
-    # Extract
     echo -n "Extracting archive... "
     if tar -xzf 3proxy.tar.gz; then
         print_success "Archive extracted"
@@ -320,31 +301,24 @@ install_3proxy() {
 
     cd "3proxy-${PROXY_VERSION}" || error_exit "Failed to enter 3proxy directory"
 
-    # Enable anonymous mode
     echo -n "Configuring anonymous mode... "
-    echo "#define ANONYMOUS 1" > src/define.txt
-    
-    # Insert the define at the beginning of proxy.h
-    if grep -q "ANONYMOUS" src/proxy.h; then
-        print_success "Anonymous mode already enabled"
-    else
-        sed -i '1i #define ANONYMOUS 1' src/proxy.h
-        print_success "Anonymous mode enabled"
-    fi
+    sed -i '1i #define ANONYMOUS 1' src/proxy.h
+    print_success "Anonymous mode enabled"
 
-    # Compile
     echo -n "Compiling 3proxy (this may take a minute)... "
-    if make -f Makefile.Linux > /dev/null 2>&1; then
+    if make -f Makefile.Linux > /tmp/3proxy_compile.log 2>&1; then
         print_success "3proxy compiled successfully"
     else
-        error_exit "Failed to compile 3proxy"
+        print_error "Failed to compile 3proxy"
+        echo ""
+        print_info "Compilation log:"
+        tail -20 /tmp/3proxy_compile.log
+        error_exit "Compilation failed. Check log above."
     fi
 
-    # Install
     echo -n "Installing 3proxy... "
     mkdir -p "$PROXY_DIR"/{bin,logs}
     
-    # Make sure no process is using the binary
     pkill -9 3proxy > /dev/null 2>&1
     sleep 1
     
@@ -367,10 +341,8 @@ configure_3proxy() {
     print_separator
     echo ""
 
-    # Increase system limits
     echo -n "Configuring system limits... "
     
-    # Set ulimits in limits.conf (only if not already present)
     if ! grep -q "nofile 65535" /etc/security/limits.conf; then
         cat >> /etc/security/limits.conf <<EOF
 * soft nofile 65535
@@ -380,12 +352,13 @@ configure_3proxy() {
 EOF
     fi
 
-    # Set ulimits in sysctl (only if not already present)
     if ! grep -q "fs.file-max = 65535" /etc/sysctl.conf; then
         cat >> /etc/sysctl.conf <<EOF
 fs.file-max = 65535
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_tw_reuse = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
 EOF
     fi
     
@@ -393,7 +366,6 @@ EOF
     
     print_success "System limits configured"
 
-    # Create config file
     cat > "$PROXY_CFG" <<EOF
 # 3proxy configuration file
 # Generated by Elite Proxy Setup Script
@@ -412,20 +384,20 @@ logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
 rotate 30
 
 # Authentication
-auth strong
 users $PROXY_USER:CL:$PROXY_PASS
 
-# Allow authenticated user
-allow $PROXY_USER
-
 # HTTP Proxy (Anonymous/Elite mode)
-proxy -p$HTTP_PORT -a -n -i$SERVER_IP -e$SERVER_IP
+auth strong
+allow $PROXY_USER
+proxy -p$HTTP_PORT -a -n -i0.0.0.0 -e$SERVER_IP
 
 # SOCKS5 Proxy (Anonymous mode)
-socks -p$SOCKS_PORT -a -n -i$SERVER_IP -e$SERVER_IP
+auth strong
+allow $PROXY_USER
+socks -p$SOCKS_PORT -i0.0.0.0 -e$SERVER_IP
 
 # Deny all others
-deny *
+flush
 EOF
 
     if [ -f "$PROXY_CFG" ]; then
@@ -450,24 +422,18 @@ configure_firewall() {
     print_separator
     echo ""
 
-    # Check if UFW is active
     if systemctl is-active --quiet ufw; then
         UFW_WAS_ACTIVE=true
     else
         UFW_WAS_ACTIVE=false
     fi
 
-    # Configure UFW
     echo -n "Configuring UFW rules... "
     
-    # Allow SSH first (important!)
     ufw allow 22/tcp > /dev/null 2>&1
-    
-    # Allow proxy ports
     ufw allow $HTTP_PORT/tcp > /dev/null 2>&1
     ufw allow $SOCKS_PORT/tcp > /dev/null 2>&1
     
-    # Enable UFW if it wasn't active
     if [ "$UFW_WAS_ACTIVE" = false ]; then
         echo "y" | ufw enable > /dev/null 2>&1
     else
@@ -492,7 +458,6 @@ setup_service() {
     print_separator
     echo ""
 
-    # Create systemd service with proper configuration
     cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy Proxy Server
@@ -514,10 +479,8 @@ LimitNPROC=65535
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd
     systemctl daemon-reload
 
-    # Enable service
     if systemctl enable 3proxy > /dev/null 2>&1; then
         print_success "Systemd service created"
         print_success "Service enabled for auto-start"
@@ -540,20 +503,17 @@ start_proxy() {
 
     echo -n "Starting 3proxy service... "
     
-    # Start the service
     if systemctl start 3proxy; then
         sleep 3
         
-        # Check if it's actually running
         if systemctl is-active --quiet 3proxy; then
             print_success "3proxy started successfully"
             
-            # Verify processes are listening
             sleep 1
-            if netstat -tuln 2>/dev/null | grep -q ":$HTTP_PORT " && netstat -tuln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
-                print_success "Proxies are listening on configured ports"
-            else
-                print_warning "Service started but ports may not be listening yet"
+            if command -v netstat &> /dev/null; then
+                if netstat -tuln 2>/dev/null | grep -q ":$HTTP_PORT " && netstat -tuln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
+                    print_success "Proxies are listening on configured ports"
+                fi
             fi
         else
             echo ""
@@ -583,13 +543,11 @@ test_proxies() {
     print_separator
     echo ""
 
-    # Wait a moment for proxies to fully initialize
     sleep 3
 
-    # Test HTTP Proxy
     echo -e "${CYAN}[Testing HTTP Proxy]${NC}"
     
-    HTTP_TEST=$(curl -s -x "http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT" \
+    HTTP_TEST=$(curl -s -x "http://$PROXY_USER:$PROXY_PASS@127.0.0.1:$HTTP_PORT" \
                      --max-time 15 \
                      -w "\n%{http_code}|%{time_total}" \
                      "http://ifconfig.me" 2>/dev/null)
@@ -599,7 +557,6 @@ test_proxies() {
         HTTP_CODE=$(echo "$HTTP_TEST" | tail -n 1 | cut -d'|' -f1)
         HTTP_TIME=$(echo "$HTTP_TEST" | tail -n 1 | cut -d'|' -f2)
         
-        # Calculate milliseconds (handle both integer and decimal)
         if command -v bc &> /dev/null; then
             HTTP_TIME_MS=$(echo "$HTTP_TIME * 1000" | bc | cut -d'.' -f1)
         else
@@ -618,16 +575,14 @@ test_proxies() {
         fi
     else
         print_error "HTTP Proxy: Connection failed"
-        print_info "This might be a temporary issue. Try testing manually."
         HTTP_WORKING=false
     fi
 
     echo ""
 
-    # Test SOCKS5 Proxy
     echo -e "${CYAN}[Testing SOCKS5 Proxy]${NC}"
     
-    SOCKS_TEST=$(curl -s -x "socks5://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$SOCKS_PORT" \
+    SOCKS_TEST=$(curl -s -x "socks5://$PROXY_USER:$PROXY_PASS@127.0.0.1:$SOCKS_PORT" \
                       --max-time 15 \
                       -w "\n%{http_code}|%{time_total}" \
                       "http://ifconfig.me" 2>/dev/null)
@@ -637,7 +592,6 @@ test_proxies() {
         SOCKS_CODE=$(echo "$SOCKS_TEST" | tail -n 1 | cut -d'|' -f1)
         SOCKS_TIME=$(echo "$SOCKS_TEST" | tail -n 1 | cut -d'|' -f2)
         
-        # Calculate milliseconds
         if command -v bc &> /dev/null; then
             SOCKS_TIME_MS=$(echo "$SOCKS_TIME * 1000" | bc | cut -d'.' -f1)
         else
@@ -656,14 +610,12 @@ test_proxies() {
         fi
     else
         print_error "SOCKS5 Proxy: Connection failed"
-        print_info "This might be a temporary issue. Try testing manually."
         SOCKS_WORKING=false
     fi
 
     print_separator
     echo ""
 
-    # Summary
     if [ "$HTTP_WORKING" = true ] && [ "$SOCKS_WORKING" = true ]; then
         print_success "All proxies are working correctly!"
     elif [ "$HTTP_WORKING" = true ] || [ "$SOCKS_WORKING" = true ]; then
@@ -770,7 +722,6 @@ main() {
     print_success "Internet connection OK"
     echo ""
     
-    # Check and remove existing installation
     check_existing_installation
     
     get_user_input
@@ -787,7 +738,6 @@ main() {
     save_details
     display_results
     
-    # Cleanup
     cleanup
     
     print_success "Setup completed successfully!"

@@ -111,6 +111,43 @@ check_internet() {
     fi
 }
 
+check_existing_installation() {
+    echo -n "Checking for existing installation... "
+    
+    # Check if 3proxy service exists and is running
+    if systemctl list-units --full -all | grep -q "3proxy.service"; then
+        print_warning "Existing 3proxy installation detected"
+        
+        # Stop the service
+        echo -n "Stopping existing 3proxy service... "
+        systemctl stop 3proxy > /dev/null 2>&1
+        sleep 2
+        print_success "Service stopped"
+        
+        # Disable the service
+        echo -n "Disabling existing service... "
+        systemctl disable 3proxy > /dev/null 2>&1
+        print_success "Service disabled"
+        
+        # Kill any remaining processes
+        echo -n "Killing any remaining 3proxy processes... "
+        pkill -9 3proxy > /dev/null 2>&1
+        sleep 1
+        print_success "Processes terminated"
+        
+        # Remove old installation
+        echo -n "Removing old installation... "
+        rm -rf "$PROXY_DIR" > /dev/null 2>&1
+        rm -f /etc/systemd/system/3proxy.service > /dev/null 2>&1
+        systemctl daemon-reload > /dev/null 2>&1
+        print_success "Old installation removed"
+        
+        echo ""
+    else
+        print_success "No existing installation found"
+    fi
+}
+
 #############################################
 # Get User Input
 #############################################
@@ -307,6 +344,10 @@ install_3proxy() {
     echo -n "Installing 3proxy... "
     mkdir -p "$PROXY_DIR"/{bin,logs}
     
+    # Make sure no process is using the binary
+    pkill -9 3proxy > /dev/null 2>&1
+    sleep 1
+    
     if cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN"; then
         print_success "3proxy installed to $PROXY_DIR"
     else
@@ -329,20 +370,24 @@ configure_3proxy() {
     # Increase system limits
     echo -n "Configuring system limits... "
     
-    # Set ulimits in limits.conf
-    cat >> /etc/security/limits.conf <<EOF
+    # Set ulimits in limits.conf (only if not already present)
+    if ! grep -q "nofile 65535" /etc/security/limits.conf; then
+        cat >> /etc/security/limits.conf <<EOF
 * soft nofile 65535
 * hard nofile 65535
 * soft nproc 65535
 * hard nproc 65535
 EOF
+    fi
 
-    # Set ulimits in sysctl
-    cat >> /etc/sysctl.conf <<EOF
+    # Set ulimits in sysctl (only if not already present)
+    if ! grep -q "fs.file-max = 65535" /etc/sysctl.conf; then
+        cat >> /etc/sysctl.conf <<EOF
 fs.file-max = 65535
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_tw_reuse = 1
 EOF
+    fi
     
     sysctl -p > /dev/null 2>&1
     
@@ -724,6 +769,9 @@ main() {
     print_success "Running as root"
     print_success "Internet connection OK"
     echo ""
+    
+    # Check and remove existing installation
+    check_existing_installation
     
     get_user_input
     detect_ip

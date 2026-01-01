@@ -1,10 +1,10 @@
 #!/bin/bash
 
 #############################################
-# Elite Proxy Setup Script v1.2
-# Sets up HTTP + SOCKS5 Anonymous Proxies
+# Elite Proxy Setup Script v1.3
+# Sets up HTTP Anonymous Proxy
 # Using 3proxy on Ubuntu/Debian
-# Logging disabled to save disk space
+# Auto-detects NAT environments (AWS, etc.)
 #############################################
 
 # Color codes for output
@@ -18,7 +18,6 @@ BOLD='\033[1m'
 
 # Default ports
 DEFAULT_HTTP_PORT=3128
-DEFAULT_SOCKS_PORT=1080
 
 # Installation paths
 PROXY_DIR="/etc/3proxy"
@@ -35,8 +34,8 @@ WORK_DIR="/root/3proxy-install"
 print_header() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v1.2${NC}    ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   HTTP + SOCKS5 Anonymous Proxy   ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v1.3${NC}    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}      HTTP Anonymous Proxy          ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -143,6 +142,51 @@ check_existing_installation() {
 }
 
 #############################################
+# Detect NAT Environment
+#############################################
+
+detect_nat_environment() {
+    print_separator
+    echo -e "${BOLD}Detecting network environment...${NC}"
+    print_separator
+    echo ""
+    
+    # Get public IP
+    PUBLIC_IP=$(curl -s -4 ifconfig.me 2>/dev/null || curl -s -4 icanhazip.com 2>/dev/null || curl -s -4 ipinfo.io/ip 2>/dev/null)
+    
+    if [ -z "$PUBLIC_IP" ]; then
+        error_exit "Could not detect public IP address"
+    fi
+    
+    # Get local IP from network interface
+    LOCAL_IP=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)
+    
+    if [ -z "$LOCAL_IP" ]; then
+        error_exit "Could not detect local IP address"
+    fi
+    
+    echo -e "${BOLD}Public IP:${NC} ${GREEN}$PUBLIC_IP${NC}"
+    echo -e "${BOLD}Local IP:${NC}  ${GREEN}$LOCAL_IP${NC}"
+    
+    # Check if we're behind NAT
+    if [ "$PUBLIC_IP" != "$LOCAL_IP" ]; then
+        USE_NAT=true
+        BIND_IP=""  # Don't use -e flag for NAT environments
+        print_warning "NAT environment detected (AWS/Cloud)"
+        print_info "Will configure for NAT compatibility"
+    else
+        USE_NAT=false
+        BIND_IP="-e$PUBLIC_IP"
+        print_success "Direct IP assignment detected"
+    fi
+    
+    SERVER_IP="$PUBLIC_IP"
+    
+    print_separator
+    echo ""
+}
+
+#############################################
 # Get User Input
 #############################################
 
@@ -180,43 +224,10 @@ get_user_input() {
     read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
     HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
 
-    read -p "SOCKS5 port [$DEFAULT_SOCKS_PORT]: " SOCKS_PORT
-    SOCKS_PORT=${SOCKS_PORT:-$DEFAULT_SOCKS_PORT}
-
     if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
         error_exit "Invalid HTTP port. Must be between 1024-65535"
     fi
 
-    if ! [[ "$SOCKS_PORT" =~ ^[0-9]+$ ]] || [ "$SOCKS_PORT" -lt 1024 ] || [ "$SOCKS_PORT" -gt 65535 ]; then
-        error_exit "Invalid SOCKS5 port. Must be between 1024-65535"
-    fi
-
-    if [ "$HTTP_PORT" -eq "$SOCKS_PORT" ]; then
-        error_exit "HTTP and SOCKS5 ports must be different"
-    fi
-
-    echo ""
-}
-
-#############################################
-# Detect Server IP
-#############################################
-
-detect_ip() {
-    print_separator
-    
-    SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null || curl -s -4 icanhazip.com 2>/dev/null || curl -s -4 ipinfo.io/ip 2>/dev/null)
-    
-    if [ -z "$SERVER_IP" ]; then
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-    fi
-
-    if [ -z "$SERVER_IP" ]; then
-        error_exit "Could not detect server IP address"
-    fi
-
-    echo -e "${BOLD}Detected server IP:${NC} ${GREEN}$SERVER_IP${NC}"
-    print_separator
     echo ""
 }
 
@@ -231,7 +242,11 @@ confirm_installation() {
     echo "  Username     : $PROXY_USER"
     echo "  Password     : ${PROXY_PASS//?/*}"
     echo "  HTTP Port    : $HTTP_PORT"
-    echo "  SOCKS5 Port  : $SOCKS_PORT"
+    if [ "$USE_NAT" = true ]; then
+        echo "  Environment  : NAT (AWS/Cloud compatible)"
+    else
+        echo "  Environment  : Direct IP"
+    fi
     echo "  Logging      : Disabled (saves disk space)"
     echo ""
     
@@ -339,11 +354,10 @@ install_3proxy() {
 
 configure_3proxy() {
     print_separator
-    echo -e "${BOLD}Configuring proxies...${NC}"
+    echo -e "${BOLD}Configuring proxy...${NC}"
     print_separator
     echo ""
 
-    # CREATE DIRECTORIES FIRST - CRITICAL FIX
     echo -n "Ensuring directories exist... "
     mkdir -p "$PROXY_DIR/bin"
     mkdir -p "$PROXY_LOG"
@@ -380,43 +394,26 @@ EOF
 
     echo -n "Creating proxy configuration... "
 
-    cat > "$PROXY_CFG" <<'EOF'
+    cat > "$PROXY_CFG" <<EOF
 # 3proxy configuration file
-# Generated by Elite Proxy Setup Script v1.2
+# Generated by Elite Proxy Setup Script v1.3
 # Logging disabled to save disk space
 
 daemon
-pidfile /var/run/3proxy.pid
+pidfile $PROXY_PID
 maxconn 2000
 nscache 65536
 nserver 1.1.1.1
 nserver 8.8.8.8
 timeouts 1 5 30 60 180 1800 15 60
 
-# Logging disabled to prevent disk space issues
-# To enable logging, uncomment the following lines:
-# log "/etc/3proxy/logs/3proxy.log" D
-# logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
-# rotate 1
-
 # Authentication
-EOF
-
-    # Append user credentials
-    echo "users $PROXY_USER:CL:$PROXY_PASS" >> "$PROXY_CFG"
-
-    # Append proxy configurations
-    cat >> "$PROXY_CFG" <<EOF
+users $PROXY_USER:CL:$PROXY_PASS
 
 # HTTP Proxy (Anonymous/Elite mode)
 auth strong
 allow $PROXY_USER
-proxy -p$HTTP_PORT -a -n -i0.0.0.0 -e$SERVER_IP
-
-# SOCKS5 Proxy (Anonymous mode)
-auth strong
-allow $PROXY_USER
-socks -p$SOCKS_PORT -i0.0.0.0 -e$SERVER_IP
+proxy -p$HTTP_PORT -a -n -i0.0.0.0 $BIND_IP
 
 # Deny all others
 flush
@@ -426,9 +423,10 @@ EOF
         chmod 600 "$PROXY_CFG"
         print_success "Configuration file created"
         print_success "HTTP proxy configured (port $HTTP_PORT)"
-        print_success "SOCKS5 proxy configured (port $SOCKS_PORT)"
         print_success "Authentication set up"
-        print_success "Logging disabled (saves disk space)"
+        if [ "$USE_NAT" = true ]; then
+            print_success "NAT compatibility enabled"
+        fi
     else
         error_exit "Failed to create configuration file at $PROXY_CFG"
     fi
@@ -456,7 +454,6 @@ configure_firewall() {
     
     ufw allow 22/tcp > /dev/null 2>&1
     ufw allow $HTTP_PORT/tcp > /dev/null 2>&1
-    ufw allow $SOCKS_PORT/tcp > /dev/null 2>&1
     
     if [ "$UFW_WAS_ACTIVE" = false ]; then
         echo "y" | ufw enable > /dev/null 2>&1
@@ -466,8 +463,16 @@ configure_firewall() {
     
     print_success "UFW configured"
     print_success "Port $HTTP_PORT opened (HTTP)"
-    print_success "Port $SOCKS_PORT opened (SOCKS5)"
     print_success "SSH port protected"
+    
+    if [ "$USE_NAT" = true ]; then
+        echo ""
+        print_warning "NAT environment detected!"
+        print_info "Make sure to open port $HTTP_PORT in your cloud provider's firewall:"
+        print_info "  - AWS Lightsail: Networking > Firewall > Add rule"
+        print_info "  - AWS EC2: Security Groups > Inbound rules"
+        print_info "  - Other clouds: Check their firewall/security settings"
+    fi
 
     echo ""
 }
@@ -521,7 +526,7 @@ EOF
 
 start_proxy() {
     print_separator
-    echo -e "${BOLD}Starting proxies...${NC}"
+    echo -e "${BOLD}Starting proxy...${NC}"
     print_separator
     echo ""
 
@@ -534,9 +539,9 @@ start_proxy() {
             print_success "3proxy started successfully"
             
             sleep 1
-            if command -v netstat &> /dev/null; then
-                if netstat -tuln 2>/dev/null | grep -q ":$HTTP_PORT " && netstat -tuln 2>/dev/null | grep -q ":$SOCKS_PORT "; then
-                    print_success "Proxies are listening on configured ports"
+            if command -v ss &> /dev/null; then
+                if ss -tuln 2>/dev/null | grep -q ":$HTTP_PORT "; then
+                    print_success "Proxy is listening on port $HTTP_PORT"
                 fi
             fi
         else
@@ -558,12 +563,12 @@ start_proxy() {
 }
 
 #############################################
-# Test Proxies
+# Test Proxy
 #############################################
 
-test_proxies() {
+test_proxy() {
     print_separator
-    echo -e "${BOLD}Testing proxies...${NC}"
+    echo -e "${BOLD}Testing proxy...${NC}"
     print_separator
     echo ""
 
@@ -602,51 +607,13 @@ test_proxies() {
         HTTP_WORKING=false
     fi
 
-    echo ""
-
-    echo -e "${CYAN}[Testing SOCKS5 Proxy]${NC}"
-    
-    SOCKS_TEST=$(curl -s -x "socks5://$PROXY_USER:$PROXY_PASS@127.0.0.1:$SOCKS_PORT" \
-                      --max-time 15 \
-                      -w "\n%{http_code}|%{time_total}" \
-                      "http://ifconfig.me" 2>/dev/null)
-    
-    if [ $? -eq 0 ]; then
-        SOCKS_IP=$(echo "$SOCKS_TEST" | head -n 1)
-        SOCKS_CODE=$(echo "$SOCKS_TEST" | tail -n 1 | cut -d'|' -f1)
-        SOCKS_TIME=$(echo "$SOCKS_TEST" | tail -n 1 | cut -d'|' -f2)
-        
-        if command -v bc &> /dev/null; then
-            SOCKS_TIME_MS=$(echo "$SOCKS_TIME * 1000" | bc | cut -d'.' -f1)
-        else
-            SOCKS_TIME_MS=$(awk "BEGIN {printf \"%.0f\", $SOCKS_TIME * 1000}")
-        fi
-        
-        if [ "$SOCKS_CODE" = "200" ]; then
-            print_success "SOCKS5 Proxy: Working"
-            echo "    External IP: $SOCKS_IP"
-            echo "    Response time: ${SOCKS_TIME_MS}ms"
-            echo "    Anonymous: Yes"
-            SOCKS_WORKING=true
-        else
-            print_error "SOCKS5 Proxy: Failed (HTTP $SOCKS_CODE)"
-            SOCKS_WORKING=false
-        fi
-    else
-        print_error "SOCKS5 Proxy: Connection failed"
-        SOCKS_WORKING=false
-    fi
-
     print_separator
     echo ""
 
-    if [ "$HTTP_WORKING" = true ] && [ "$SOCKS_WORKING" = true ]; then
-        print_success "All proxies are working correctly!"
-    elif [ "$HTTP_WORKING" = true ] || [ "$SOCKS_WORKING" = true ]; then
-        print_warning "Some proxies are working, but there were issues with testing"
-        print_info "The proxies are installed. You can test them manually."
+    if [ "$HTTP_WORKING" = true ]; then
+        print_success "Proxy is working correctly!"
     else
-        print_warning "Proxy tests failed, but proxies are installed and running"
+        print_warning "Proxy test failed, but proxy is installed and running"
         print_info "This might be due to network conditions. Try testing manually:"
         echo "  curl -x http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT http://ifconfig.me"
     fi
@@ -673,11 +640,9 @@ Password: $PROXY_PASS
 HTTP Proxy:
 $SERVER_IP:$HTTP_PORT:$PROXY_USER:$PROXY_PASS
 
-SOCKS5 Proxy:
-$SERVER_IP:$SOCKS_PORT:$PROXY_USER:$PROXY_PASS
-
 ═══════════════════════════════════════
 Installation Date: $(date)
+Environment: $([ "$USE_NAT" = true ] && echo "NAT (AWS/Cloud)" || echo "Direct IP")
 Logging: Disabled (to save disk space)
 ═══════════════════════════════════════
 
@@ -690,12 +655,11 @@ Useful Commands:
 
 Test Commands:
 - Test HTTP: curl -x http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT http://ifconfig.me
-- Test SOCKS5: curl -x socks5://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$SOCKS_PORT http://ifconfig.me
 
 Configuration file: $PROXY_CFG
 
 Note: Logging is disabled to prevent disk space issues.
-To enable logging, edit $PROXY_CFG and uncomment the log lines.
+To enable logging, edit $PROXY_CFG and add log configuration.
 EOF
 
     chmod 600 "$DETAILS_FILE"
@@ -718,11 +682,16 @@ display_results() {
     echo -e "${BOLD}HTTP Proxy:${NC}"
     echo -e "${GREEN}$SERVER_IP:$HTTP_PORT:$PROXY_USER:$PROXY_PASS${NC}"
     echo ""
-    echo -e "${BOLD}SOCKS5 Proxy:${NC}"
-    echo -e "${GREEN}$SERVER_IP:$SOCKS_PORT:$PROXY_USER:$PROXY_PASS${NC}"
+    echo -e "${BOLD}Connection String:${NC}"
+    echo -e "${GREEN}http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT${NC}"
     print_separator
     echo ""
     echo -e "${CYAN}Details saved to:${NC} $DETAILS_FILE"
+    if [ "$USE_NAT" = true ]; then
+        echo -e "${CYAN}Environment:${NC} NAT (AWS/Cloud compatible)"
+    else
+        echo -e "${CYAN}Environment:${NC} Direct IP"
+    fi
     echo -e "${CYAN}Logging:${NC} Disabled (saves disk space)"
     echo ""
     print_separator
@@ -752,7 +721,7 @@ main() {
     check_existing_installation
     
     get_user_input
-    detect_ip
+    detect_nat_environment
     confirm_installation
     
     install_dependencies
@@ -761,7 +730,7 @@ main() {
     configure_firewall
     setup_service
     start_proxy
-    test_proxies
+    test_proxy
     save_details
     display_results
     

@@ -1,10 +1,10 @@
 #!/bin/bash
 
 #############################################
-# Elite Proxy Setup Script v3.0 (XRUMER EDITION)
+# Elite Proxy Setup Script v3.1 (XRUMER EDITION)
 # Sets up HTTP Anonymous Proxy via 3proxy
 # Optimized specifically for Xrumer 100s timeouts
-# Fixes: Zombie Threads, RAM Leaks, TCP Exhaustion
+# Restored: Original UI/UX, Input Validation, Confirmations
 #############################################
 
 RED='\033[0;31m'
@@ -26,7 +26,7 @@ WORK_DIR="/root/3proxy-install"
 print_header() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup v3.0 (XRUMER ED.)${NC}      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup v3.1 (XRUMER ED.)${NC}      ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   Optimized for 100s Thread Lifetime       ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}   Fixed: Zombie Threads & RAM Leaks        ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
@@ -71,6 +71,7 @@ check_os() {
 check_existing_installation() {
     echo -n "Checking for existing installation... "
     if systemctl list-units --full -all | grep -q "3proxy.service"; then
+        print_warning "Existing 3proxy installation detected"
         systemctl stop 3proxy > /dev/null 2>&1
         systemctl disable 3proxy > /dev/null 2>&1
         pkill -9 3proxy > /dev/null 2>&1
@@ -80,6 +81,102 @@ check_existing_installation() {
     else
         print_success "No existing installation found"
     fi
+    echo ""
+}
+
+detect_nat_environment() {
+    print_separator
+    echo -e "${BOLD}Detecting network environment...${NC}"
+    print_separator
+    
+    PUBLIC_IP=$(curl -s -4 --max-time 10 ifconfig.me 2>/dev/null || curl -s -4 --max-time 10 icanhazip.com 2>/dev/null)
+    LOCAL_IP=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)
+    
+    if [ -z "$PUBLIC_IP" ]; then error_exit "Could not detect public IP address"; fi
+    
+    echo -e "${BOLD}Public IP:${NC} ${GREEN}$PUBLIC_IP${NC}"
+    echo -e "${BOLD}Local IP:${NC}  ${GREEN}$LOCAL_IP${NC}"
+
+    if [ "$PUBLIC_IP" != "$LOCAL_IP" ]; then
+        USE_NAT=true
+        BIND_IP=""
+        print_warning "NAT environment detected (AWS/Cloud)"
+    else
+        USE_NAT=false
+        BIND_IP="-e$PUBLIC_IP"
+        print_success "Direct IP assignment detected"
+    fi
+    SERVER_IP="$PUBLIC_IP"
+    echo ""
+}
+
+get_user_input() {
+    print_separator
+    echo -e "${BOLD}Configuration${NC}"
+    print_separator
+    echo ""
+
+    while true; do
+        read -p "Enter proxy username: " PROXY_USER
+        if [ -z "$PROXY_USER" ]; then
+            print_error "Username cannot be empty"
+        else
+            break
+        fi
+    done
+
+    while true; do
+        read -s -p "Enter proxy password: " PROXY_PASS
+        echo ""
+        if [ -z "$PROXY_PASS" ]; then
+            print_error "Password cannot be empty"
+        else
+            read -s -p "Confirm password: " PROXY_PASS_CONFIRM
+            echo ""
+            if [ "$PROXY_PASS" != "$PROXY_PASS_CONFIRM" ]; then
+                print_error "Passwords do not match"
+            else
+                break
+            fi
+        fi
+    done
+
+    while true; do
+        read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
+        HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
+        
+        if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+            print_error "Invalid HTTP port. Must be between 1024-65535"
+        else
+            break
+        fi
+    done
+    echo ""
+}
+
+confirm_installation() {
+    echo -e "${BOLD}Installation Summary:${NC}"
+    echo ""
+    echo "  Server IP    : $SERVER_IP"
+    echo "  Username     : $PROXY_USER"
+    echo "  Password     : ${PROXY_PASS//?/*}"
+    echo "  HTTP Port    : $HTTP_PORT"
+    if [ "$USE_NAT" = true ]; then
+        echo "  Environment  : NAT (AWS/Cloud compatible)"
+    else
+        echo "  Environment  : Direct IP"
+    fi
+    echo "  Optimization : Xrumer Fast-Fail (110s timeouts)"
+    echo "  Memory       : 2GB Swap will be created"
+    echo ""
+
+    read -p "Proceed with installation? (y/n): " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Installation cancelled."
+        exit 0
+    fi
+    echo ""
 }
 
 setup_swap() {
@@ -97,31 +194,6 @@ setup_swap() {
     else
         print_success "Swap memory already exists"
     fi
-    echo ""
-}
-
-detect_nat_environment() {
-    PUBLIC_IP=$(curl -s -4 --max-time 10 ifconfig.me 2>/dev/null || curl -s -4 --max-time 10 icanhazip.com 2>/dev/null)
-    LOCAL_IP=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)
-    if [ "$PUBLIC_IP" != "$LOCAL_IP" ]; then
-        USE_NAT=true
-        BIND_IP=""
-    else
-        USE_NAT=false
-        BIND_IP="-e$PUBLIC_IP"
-    fi
-    SERVER_IP="$PUBLIC_IP"
-}
-
-get_user_input() {
-    print_separator
-    echo -e "${BOLD}Configuration${NC}"
-    print_separator
-    read -p "Enter proxy username: " PROXY_USER
-    read -s -p "Enter proxy password: " PROXY_PASS
-    echo ""
-    read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
     echo ""
 }
 
@@ -300,14 +372,42 @@ test_proxy() {
     echo ""
 }
 
+save_details() {
+    DETAILS_FILE="/root/proxy_details.txt"
+    cat > "$DETAILS_FILE" <<EOF
+═══════════════════════════════════════
+Elite Proxy Server Details (Xrumer Ed.)
+═══════════════════════════════════════
+Server IP: $SERVER_IP
+Username: $PROXY_USER
+Password: $PROXY_PASS
+HTTP Port: $HTTP_PORT
+
+Connection String:
+http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT
+
+Xrumer Optimizations Applied:
+- Timeouts synced to 110s
+- 2GB Swap Memory added
+- Kernel TCP Fast-Fail enabled
+- DNS Cache reduced to 8192
+- Max connections: 5000
+═══════════════════════════════════════
+EOF
+    chmod 600 "$DETAILS_FILE"
+}
+
 main() {
     print_header
     check_root
     check_os
     check_existing_installation
-    setup_swap
+    
     detect_nat_environment
     get_user_input
+    confirm_installation
+    
+    setup_swap
     install_dependencies
     install_3proxy
     configure_dns
@@ -317,6 +417,7 @@ main() {
     setup_service
     start_proxy
     test_proxy
+    save_details
     
     print_separator
     echo -e "${GREEN}${BOLD}Installation Complete! ✓${NC}"
@@ -326,12 +427,7 @@ main() {
     echo -e "Username   : ${GREEN}$PROXY_USER${NC}"
     echo -e "Password   : ${GREEN}$PROXY_PASS${NC}"
     echo ""
-    echo -e "${BOLD}Xrumer Optimizations Applied:${NC}"
-    echo "1. Timeouts synced to 110s (Matches your 100s Xrumer limit)"
-    echo "2. 2GB Swap Memory added to prevent RAM crashes"
-    echo "3. Kernel TCP Fast-Fail enabled (Kills dead connections in 10s)"
-    echo "4. DNS Cache reduced to 8192 to save RAM"
-    echo "5. Max connections increased to 5000"
+    echo -e "${CYAN}Details saved to:${NC} /root/proxy_details.txt"
     echo ""
     cleanup
 }

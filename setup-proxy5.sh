@@ -274,6 +274,32 @@ start_proxy() {
     fi
 }
 
+test_proxy() {
+    print_separator
+    echo -e "${BOLD}Testing proxy connection...${NC}"
+    print_separator
+    sleep 3
+    
+    HTTP_TEST=$(curl -s -x "http://$PROXY_USER:$PROXY_PASS@127.0.0.1:$HTTP_PORT" \
+                     --max-time 15 \
+                     -w "\n%{http_code}" \
+                     "http://ifconfig.me" 2>/dev/null)
+                     
+    if [ $? -eq 0 ]; then
+        HTTP_IP=$(echo "$HTTP_TEST" | head -n 1)
+        HTTP_CODE=$(echo "$HTTP_TEST" | tail -n 1)
+        
+        if [ "$HTTP_CODE" = "200" ]; then
+            print_success "Proxy is Working! (External IP: $HTTP_IP)"
+        else
+            print_error "Proxy test failed (HTTP $HTTP_CODE)"
+        fi
+    else
+        print_error "Proxy connection failed during test"
+    fi
+    echo ""
+}
+
 main() {
     print_header
     check_root
@@ -290,6 +316,7 @@ main() {
     configure_firewall
     setup_service
     start_proxy
+    test_proxy
     
     print_separator
     echo -e "${GREEN}${BOLD}Installation Complete! ✓${NC}"

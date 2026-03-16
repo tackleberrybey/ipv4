@@ -763,7 +763,7 @@ HTTP Proxy:
 $SERVER_IP:$HTTP_PORT:$PROXY_USER:$PROXY_PASS
 
 Connection String:
-http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT
+$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT
 
 ═══════════════════════════════════════
 Date        : $(date)

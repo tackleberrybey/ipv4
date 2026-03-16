@@ -1,26 +1,29 @@
 #!/bin/bash
 
 #############################################
-# Elite Proxy Setup Script v2.0 (XRUMER OPTIMIZED)
+# Elite Proxy Setup Script v4.0 (XRUMER EDITION)
 # Sets up HTTP Anonymous Proxy
 # Using 3proxy on Ubuntu/Debian
 # Auto-detects NAT environments (AWS, etc.)
-# FIXED: DNS persistence, file limits, memory optimization
+#
+# FIXES:
+# - nf_conntrack table overflow (ROOT CAUSE)
+# - Zombie threads (tcp_syn_retries=1)
+# - DNS bottleneck (nserver removed, OS handles DNS)
+# - RAM crashes (2GB Swap)
+# - XEvil captcha timeout (ClientIdle=600s)
+# - Slow-but-alive sites (ServerConnect=30s, Resolve=15s)
 #############################################
 
-# Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 BOLD='\033[1m'
 
-# Default ports
 DEFAULT_HTTP_PORT=3128
-
-# Installation paths
 PROXY_DIR="/etc/3proxy"
 PROXY_BIN="$PROXY_DIR/bin/3proxy"
 PROXY_CFG="$PROXY_DIR/3proxy.cfg"
@@ -28,16 +31,12 @@ PROXY_LOG="$PROXY_DIR/logs"
 PROXY_PID="/run/3proxy.pid"
 WORK_DIR="/root/3proxy-install"
 
-#############################################
-# Helper Functions
-#############################################
-
 print_header() {
     clear
     echo -e "${CYAN}╔════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v2.0${NC}    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   ${BOLD}Elite Proxy Setup Script v4.0${NC}    ${CYAN}║${NC}"
     echo -e "${CYAN}║${NC}      HTTP Anonymous Proxy          ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}   Fixed: DNS, Limits, Memory       ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}   Xrumer + XEvil Optimized         ${CYAN}║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -46,21 +45,10 @@ print_separator() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
-print_success() {
-    echo -e "${GREEN}✓${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}✗${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
-}
-
-print_info() {
-    echo -e "${CYAN}ℹ${NC} $1"
-}
+print_success() { echo -e "${GREEN}✓${NC} $1"; }
+print_error()   { echo -e "${RED}✗${NC} $1"; }
+print_warning() { echo -e "${YELLOW}⚠${NC} $1"; }
+print_info()    { echo -e "${CYAN}ℹ${NC} $1"; }
 
 error_exit() {
     print_error "$1"
@@ -116,28 +104,28 @@ check_existing_installation() {
 
     if systemctl list-units --full -all | grep -q "3proxy.service"; then
         print_warning "Existing 3proxy installation detected"
-        
+
         echo -n "Stopping existing 3proxy service... "
         systemctl stop 3proxy > /dev/null 2>&1
         sleep 2
         print_success "Service stopped"
-        
+
         echo -n "Disabling existing service... "
         systemctl disable 3proxy > /dev/null 2>&1
         print_success "Service disabled"
-        
+
         echo -n "Killing any remaining 3proxy processes... "
         pkill -9 3proxy > /dev/null 2>&1
         sleep 1
         print_success "Processes terminated"
-        
+
         echo -n "Removing old installation... "
         rm -rf "$PROXY_DIR" > /dev/null 2>&1
         rm -f /etc/systemd/system/3proxy.service > /dev/null 2>&1
         rm -rf /etc/systemd/system/3proxy.service.d > /dev/null 2>&1
         systemctl daemon-reload > /dev/null 2>&1
         print_success "Old installation removed"
-        
+
         echo ""
     else
         print_success "No existing installation found"
@@ -154,14 +142,14 @@ detect_nat_environment() {
     print_separator
     echo ""
 
-    # Get public IP
-    PUBLIC_IP=$(curl -s -4 --max-time 10 ifconfig.me 2>/dev/null || curl -s -4 --max-time 10 icanhazip.com 2>/dev/null || curl -s -4 --max-time 10 ipinfo.io/ip 2>/dev/null)
+    PUBLIC_IP=$(curl -s -4 --max-time 10 ifconfig.me 2>/dev/null || \
+                curl -s -4 --max-time 10 icanhazip.com 2>/dev/null || \
+                curl -s -4 --max-time 10 ipinfo.io/ip 2>/dev/null)
 
     if [ -z "$PUBLIC_IP" ]; then
         error_exit "Could not detect public IP address"
     fi
 
-    # Get local IP from network interface
     LOCAL_IP=$(ip addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)
 
     if [ -z "$LOCAL_IP" ]; then
@@ -171,10 +159,9 @@ detect_nat_environment() {
     echo -e "${BOLD}Public IP:${NC} ${GREEN}$PUBLIC_IP${NC}"
     echo -e "${BOLD}Local IP:${NC}  ${GREEN}$LOCAL_IP${NC}"
 
-    # Check if we're behind NAT
     if [ "$PUBLIC_IP" != "$LOCAL_IP" ]; then
         USE_NAT=true
-        BIND_IP=""  # Don't use -e flag for NAT environments
+        BIND_IP=""
         print_warning "NAT environment detected (AWS/Cloud)"
         print_info "Will configure for NAT compatibility"
     else
@@ -224,12 +211,18 @@ get_user_input() {
         fi
     done
 
-    read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
-    HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
+    while true; do
+        read -p "HTTP port [$DEFAULT_HTTP_PORT]: " HTTP_PORT
+        HTTP_PORT=${HTTP_PORT:-$DEFAULT_HTTP_PORT}
 
-    if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
-        error_exit "Invalid HTTP port. Must be between 1024-65535"
-    fi
+        if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || \
+           [ "$HTTP_PORT" -lt 1024 ] || \
+           [ "$HTTP_PORT" -gt 65535 ]; then
+            print_error "Invalid HTTP port. Must be between 1024-65535"
+        else
+            break
+        fi
+    done
 
     echo ""
 }
@@ -251,8 +244,9 @@ confirm_installation() {
         echo "  Environment  : Direct IP"
     fi
     echo "  Logging      : Disabled (saves disk space)"
-    echo "  DNS          : Fixed (1.1.1.1, 8.8.8.8)"
-    echo "  File Limits  : 100000 (Xrumer optimized)"
+    echo "  DNS          : OS handles (no 3proxy DNS bottleneck)"
+    echo "  Conntrack    : 262144 (ROOT FIX applied)"
+    echo "  XEvil        : ClientIdle=600s (captcha safe)"
     echo ""
 
     read -p "Proceed with installation? (y/n): " -n 1 -r
@@ -265,7 +259,7 @@ confirm_installation() {
 }
 
 #############################################
-# Setup Swap (XRUMER FIX)
+# Setup Swap
 #############################################
 
 setup_swap() {
@@ -273,17 +267,20 @@ setup_swap() {
     echo -e "${BOLD}Configuring Virtual Memory (Swap)...${NC}"
     print_separator
     echo ""
+
     if [ $(swapon --show | wc -l) -eq 0 ]; then
-        echo -n "Creating 2GB Swap file for Xrumer stability... "
-        fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 > /dev/null 2>&1
+        echo -n "Creating 2GB Swap file... "
+        fallocate -l 2G /swapfile || \
+            dd if=/dev/zero of=/swapfile bs=1M count=2048 > /dev/null 2>&1
         chmod 600 /swapfile
         mkswap /swapfile > /dev/null 2>&1
         swapon /swapfile
         echo '/swapfile none swap sw 0 0' >> /etc/fstab
-        print_success "2GB Swap created successfully"
+        print_success "2GB Swap created"
     else
-        print_success "Swap memory already exists"
+        print_success "Swap already exists"
     fi
+
     echo ""
 }
 
@@ -304,7 +301,8 @@ install_dependencies() {
         error_exit "Failed to update system"
     fi
 
-    PACKAGES="build-essential gcc g++ make curl wget git ufw fail2ban libevent-dev"
+    PACKAGES="build-essential gcc g++ make curl wget git ufw \
+              fail2ban libevent-dev conntrack"
 
     echo -n "Installing build tools... "
     if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $PACKAGES > /dev/null 2>&1; then
@@ -331,20 +329,21 @@ install_3proxy() {
 
     echo -n "Downloading 3proxy... "
     PROXY_VERSION="0.9.5"
-    if wget -q "https://github.com/3proxy/3proxy/archive/${PROXY_VERSION}.tar.gz" -O 3proxy.tar.gz; then
-        print_success "3proxy downloaded"
+    if wget -q "https://github.com/3proxy/3proxy/archive/${PROXY_VERSION}.tar.gz" \
+            -O 3proxy.tar.gz; then
+        print_success "Downloaded"
     else
         error_exit "Failed to download 3proxy"
     fi
 
     echo -n "Extracting archive... "
     if tar -xzf 3proxy.tar.gz; then
-        print_success "Archive extracted"
+        print_success "Extracted"
     else
-        error_exit "Failed to extract 3proxy"
+        error_exit "Failed to extract"
     fi
 
-    cd "3proxy-${PROXY_VERSION}" || error_exit "Failed to enter 3proxy directory"
+    cd "3proxy-${PROXY_VERSION}" || error_exit "Failed to enter directory"
 
     echo -n "Configuring anonymous mode... "
     sed -i '1i #define ANONYMOUS 1' src/proxy.h
@@ -352,46 +351,42 @@ install_3proxy() {
 
     echo -n "Compiling 3proxy (this may take a minute)... "
     if make -f Makefile.Linux > /tmp/3proxy_compile.log 2>&1; then
-        print_success "3proxy compiled successfully"
+        print_success "Compiled successfully"
     else
-        print_error "Failed to compile 3proxy"
-        echo ""
-        print_info "Compilation log:"
+        print_error "Compilation failed"
         tail -20 /tmp/3proxy_compile.log
-        error_exit "Compilation failed. Check log above."
+        error_exit "Check log above."
     fi
 
     echo -n "Installing 3proxy... "
     mkdir -p "$PROXY_DIR"/{bin,logs}
-
     pkill -9 3proxy > /dev/null 2>&1
     sleep 1
 
     if cp bin/3proxy "$PROXY_BIN" && chmod +x "$PROXY_BIN"; then
-        print_success "3proxy installed to $PROXY_DIR"
+        print_success "Installed to $PROXY_DIR"
     else
-        error_exit "Failed to install 3proxy"
+        error_exit "Failed to install"
     fi
 
     echo ""
 }
 
 #############################################
-# Configure DNS (FIXED)
+# Configure DNS
 #############################################
 
 configure_dns() {
     print_separator
-    echo -e "${BOLD}Configuring DNS (permanent fix)...${NC}"
+    echo -e "${BOLD}Configuring DNS...${NC}"
     print_separator
     echo ""
 
     echo -n "Setting up DNS servers... "
 
-    # Method 1: Configure systemd-resolved (modern Ubuntu/Debian)
     if systemctl is-active --quiet systemd-resolved; then
         mkdir -p /etc/systemd/resolved.conf.d
-        cat > /etc/systemd/resolved.conf.d/3proxy.conf <<EOF
+        cat > /etc/systemd/resolved.conf.d/proxy.conf <<EOF
 [Resolve]
 DNS=1.1.1.1 8.8.8.8 8.8.4.4
 FallbackDNS=1.0.0.1
@@ -400,7 +395,6 @@ EOF
         systemctl restart systemd-resolved > /dev/null 2>&1
         print_success "DNS configured via systemd-resolved"
     else
-        # Method 2: Direct resolv.conf (older systems)
         cat > /etc/resolv.conf <<EOF
 nameserver 1.1.1.1
 nameserver 8.8.8.8
@@ -409,7 +403,6 @@ EOF
         print_success "DNS configured via resolv.conf"
     fi
 
-    # Verify DNS works
     echo -n "Testing DNS resolution... "
     if nslookup google.com 1.1.1.1 > /dev/null 2>&1; then
         print_success "DNS working"
@@ -421,74 +414,118 @@ EOF
 }
 
 #############################################
-# Configure 3proxy (XRUMER OPTIMIZED)
+# Configure System (Kernel + Conntrack)
+#############################################
+
+configure_system() {
+    print_separator
+    echo -e "${BOLD}Configuring system limits and kernel...${NC}"
+    print_separator
+    echo ""
+
+    echo -n "Configuring file limits... "
+    cat > /etc/security/limits.conf <<EOF
+* soft nofile 100000
+* hard nofile 100000
+* soft nproc 100000
+* hard nproc 100000
+EOF
+    print_success "File limits set to 100000"
+
+    echo -n "Configuring kernel TCP settings... "
+    cat > /etc/sysctl.conf <<EOF
+# Elite Proxy v4.0 - Xrumer Optimized
+
+# File limits
+fs.file-max = 2097152
+
+# TCP performance
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 10
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Fast-fail for dead servers (zombie thread killer)
+net.ipv4.tcp_syn_retries = 1
+net.ipv4.tcp_synack_retries = 1
+
+# TIME-WAIT management
+net.ipv4.tcp_max_tw_buckets = 1440000
+
+# Keepalive
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+
+# Orphan connection cleanup
+net.ipv4.tcp_orphan_retries = 1
+net.ipv4.tcp_max_orphans = 8192
+net.ipv4.tcp_abort_on_overflow = 1
+
+# *** ROOT FIX: nf_conntrack overflow ***
+# Default 7680 was causing silent packet drops
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 120
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 10
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 15
+
+# Disable IPv6
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+
+    sysctl -p > /dev/null 2>&1
+    print_success "Kernel settings applied"
+
+    echo -n "Clearing existing conntrack table... "
+    conntrack -F > /dev/null 2>&1 || true
+    print_success "Conntrack table cleared"
+
+    echo ""
+}
+
+#############################################
+# Configure 3proxy
 #############################################
 
 configure_3proxy() {
     print_separator
-    echo -e "${BOLD}Configuring proxy...${NC}"
+    echo -e "${BOLD}Configuring 3proxy...${NC}"
     print_separator
     echo ""
 
     echo -n "Ensuring directories exist... "
     mkdir -p "$PROXY_DIR/bin"
     mkdir -p "$PROXY_LOG"
-
-    if [ ! -d "$PROXY_DIR" ]; then
-        error_exit "Failed to create $PROXY_DIR directory"
-    fi
     print_success "Directories verified"
-
-    echo -n "Configuring system limits... "
-
-    # Configure system-wide limits (XRUMER FIX)
-    cat > /etc/security/limits.conf <<EOF
-# 3proxy file limits
-* soft nofile 100000
-* hard nofile 100000
-* soft nproc 100000
-* hard nproc 100000
-EOF
-
-    # Configure sysctl (XRUMER FIX)
-    cat > /etc/sysctl.conf <<EOF
-# 3proxy system limits
-fs.file-max = 2097152
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_max_tw_buckets = 1440000
-net.ipv4.tcp_keepalive_time = 120
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-EOF
-
-    sysctl -p > /dev/null 2>&1
-
-    print_success "System limits configured"
 
     echo -n "Creating proxy configuration... "
 
     cat > "$PROXY_CFG" <<EOF
-# 3proxy configuration file
-# Generated by Elite Proxy Setup Script v2.0
-# Logging disabled to save disk space
+# 3proxy configuration - Elite Proxy v4.0
+# Xrumer + XEvil Optimized
 
 daemon
 pidfile $PROXY_PID
 maxconn 5000
-nscache 8192
-nserver 1.1.1.1
-nserver 8.8.8.8
 
-# XRUMER TIMEOUT SYNC (110 seconds max)
-timeouts 10 10 110 110 25 110 10 110
+# DNS handled by OS (no nserver - prevents DNS bottleneck)
+
+# Timeout configuration:
+# ClientRead ClientWrite ServerRead ServerWrite ServerConnect ClientIdle Resolve ServerIdle
+#
+# ClientRead  (10s): Xrumer sends request to proxy (near-instant, 10s safe)
+# ClientWrite (10s): Proxy sends response to Xrumer (fast local transfer)
+# ServerRead (110s): Wait for forum page (Xrumer GET limit=20s, POST limit=100s)
+# ServerWrite(110s): Send form data to forum (Xrumer POST limit=100s)
+# ServerConnect(30s): TCP handshake with forum (allows slow-but-alive sites)
+# ClientIdle (600s): XEvil captcha solving can take 250+ seconds
+# Resolve    (15s): DNS for slow nameservers
+# ServerIdle (600s): Forum idle during XEvil processing
+timeouts 10 10 110 110 30 600 15 600
 
 # Authentication
 users $PROXY_USER:CL:$PROXY_PASS
@@ -511,7 +548,7 @@ EOF
             print_success "NAT compatibility enabled"
         fi
     else
-        error_exit "Failed to create configuration file at $PROXY_CFG"
+        error_exit "Failed to create configuration file"
     fi
 
     echo ""
@@ -534,7 +571,6 @@ configure_firewall() {
     fi
 
     echo -n "Configuring UFW rules... "
-
     ufw allow 22/tcp > /dev/null 2>&1
     ufw allow $HTTP_PORT/tcp > /dev/null 2>&1
 
@@ -545,23 +581,22 @@ configure_firewall() {
     fi
 
     print_success "UFW configured"
-    print_success "Port $HTTP_PORT opened (HTTP)"
+    print_success "Port $HTTP_PORT opened"
     print_success "SSH port protected"
 
     if [ "$USE_NAT" = true ]; then
         echo ""
         print_warning "NAT environment detected!"
-        print_info "Make sure to open port $HTTP_PORT in your cloud provider's firewall:"
-        print_info "  - AWS Lightsail: Networking > Firewall > Add rule"
-        print_info "  - AWS EC2: Security Groups > Inbound rules"
-        print_info "  - Other clouds: Check their firewall/security settings"
+        print_info "Open port $HTTP_PORT in your cloud provider's firewall:"
+        print_info "  - AWS Lightsail : Networking > Firewall > Add rule"
+        print_info "  - AWS EC2       : Security Groups > Inbound rules"
     fi
 
     echo ""
 }
 
 #############################################
-# Setup Systemd Service (XRUMER OPTIMIZED)
+# Setup Systemd Service
 #############################################
 
 setup_service() {
@@ -574,7 +609,7 @@ setup_service() {
 
     cat > /etc/systemd/system/3proxy.service <<EOF
 [Unit]
-Description=3proxy Proxy Server
+Description=3proxy Proxy Server (Xrumer Edition v4.0)
 After=network.target
 
 [Service]
@@ -595,17 +630,14 @@ EOF
 
     print_success "Service file created"
 
-    echo -n "Creating service override for limits... "
-
+    echo -n "Creating service override... "
     mkdir -p /etc/systemd/system/3proxy.service.d
-
     cat > /etc/systemd/system/3proxy.service.d/override.conf <<EOF
 [Service]
 LimitNOFILE=100000
 LimitNPROC=100000
 LimitCORE=infinity
 EOF
-
     print_success "Service limits configured"
 
     systemctl daemon-reload
@@ -613,7 +645,7 @@ EOF
     if systemctl enable 3proxy > /dev/null 2>&1; then
         print_success "Service enabled for auto-start"
     else
-        error_exit "Failed to enable 3proxy service"
+        error_exit "Failed to enable service"
     fi
 
     echo ""
@@ -633,29 +665,24 @@ start_proxy() {
 
     if systemctl start 3proxy; then
         sleep 3
-        
+
         if systemctl is-active --quiet 3proxy; then
             print_success "3proxy started successfully"
-            
-            sleep 1
-            if command -v ss &> /dev/null; then
-                if ss -tuln 2>/dev/null | grep -q ":$HTTP_PORT "; then
-                    print_success "Proxy is listening on port $HTTP_PORT"
-                fi
+
+            if ss -tuln 2>/dev/null | grep -q ":$HTTP_PORT "; then
+                print_success "Proxy is listening on port $HTTP_PORT"
             fi
         else
             echo ""
-            print_error "3proxy failed to start properly"
-            print_info "Checking logs..."
+            print_error "3proxy failed to start"
             journalctl -u 3proxy -n 20 --no-pager
-            error_exit "Service failed to start. Check logs above."
+            error_exit "Service failed to start."
         fi
     else
         echo ""
-        print_error "Failed to start 3proxy service"
-        print_info "Checking logs..."
+        print_error "Failed to start 3proxy"
         journalctl -u 3proxy -n 20 --no-pager
-        error_exit "Service failed to start. Check logs above."
+        error_exit "Service failed to start."
     fi
 
     echo ""
@@ -675,27 +702,23 @@ test_proxy() {
 
     echo -e "${CYAN}[Testing HTTP Proxy]${NC}"
 
-    HTTP_TEST=$(curl -s -x "http://$PROXY_USER:$PROXY_PASS@127.0.0.1:$HTTP_PORT" \
-                     --max-time 15 \
-                     -w "\n%{http_code}|%{time_total}" \
-                     "http://ifconfig.me" 2>/dev/null)
+    HTTP_TEST=$(curl -s \
+        -x "http://$PROXY_USER:$PROXY_PASS@127.0.0.1:$HTTP_PORT" \
+        --max-time 15 \
+        -w "\n%{http_code}|%{time_total}" \
+        "http://ifconfig.me" 2>/dev/null)
 
     if [ $? -eq 0 ]; then
         HTTP_IP=$(echo "$HTTP_TEST" | head -n 1)
         HTTP_CODE=$(echo "$HTTP_TEST" | tail -n 1 | cut -d'|' -f1)
         HTTP_TIME=$(echo "$HTTP_TEST" | tail -n 1 | cut -d'|' -f2)
-        
-        if command -v bc &> /dev/null; then
-            HTTP_TIME_MS=$(echo "$HTTP_TIME * 1000" | bc | cut -d'.' -f1)
-        else
-            HTTP_TIME_MS=$(awk "BEGIN {printf \"%.0f\", $HTTP_TIME * 1000}")
-        fi
-        
+        HTTP_TIME_MS=$(awk "BEGIN {printf \"%.0f\", $HTTP_TIME * 1000}")
+
         if [ "$HTTP_CODE" = "200" ]; then
             print_success "HTTP Proxy: Working"
-            echo "    External IP: $HTTP_IP"
-            echo "    Response time: ${HTTP_TIME_MS}ms"
-            echo "    Anonymous: Yes"
+            echo "    External IP    : $HTTP_IP"
+            echo "    Response time  : ${HTTP_TIME_MS}ms"
+            echo "    Anonymous      : Yes"
             HTTP_WORKING=true
         else
             print_error "HTTP Proxy: Failed (HTTP $HTTP_CODE)"
@@ -712,8 +735,7 @@ test_proxy() {
     if [ "$HTTP_WORKING" = true ]; then
         print_success "Proxy is working correctly!"
     else
-        print_warning "Proxy test failed, but proxy is installed and running"
-        print_info "This might be due to network conditions. Try testing manually:"
+        print_warning "Test failed but proxy is running. Try manually:"
         echo "  curl -x http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT http://ifconfig.me"
     fi
 
@@ -729,12 +751,13 @@ save_details() {
 
     cat > "$DETAILS_FILE" <<EOF
 ═══════════════════════════════════════
-Elite Proxy Server Details v2.0
+Elite Proxy Server v4.0 (Xrumer Ed.)
 ═══════════════════════════════════════
 
-Server IP: $SERVER_IP
-Username: $PROXY_USER
-Password: $PROXY_PASS
+Server IP : $SERVER_IP
+Username  : $PROXY_USER
+Password  : $PROXY_PASS
+HTTP Port : $HTTP_PORT
 
 HTTP Proxy:
 $SERVER_IP:$HTTP_PORT:$PROXY_USER:$PROXY_PASS
@@ -743,37 +766,28 @@ Connection String:
 http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT
 
 ═══════════════════════════════════════
-Installation Date: $(date)
-Environment: $([ "$USE_NAT" = true ] && echo "NAT (AWS/Cloud)" || echo "Direct IP")
-Logging: Disabled (to save disk space)
-DNS: Fixed (1.1.1.1, 8.8.8.8)
-File Limits: 100000 (high performance)
+Date        : $(date)
+Environment : $([ "$USE_NAT" = true ] && echo "NAT (AWS/Cloud)" || echo "Direct IP")
 ═══════════════════════════════════════
 
+Fixes Applied:
+✓ nf_conntrack_max=262144 (ROOT FIX - no more packet drops)
+✓ tcp_syn_retries=1 (dead servers fail in 3s, not 130s)
+✓ nserver removed (OS handles DNS, no bottleneck)
+✓ ClientIdle=600s (XEvil captcha 250s+ safe)
+✓ ServerConnect=30s (slow-but-alive forums included)
+✓ Resolve=15s (slow DNS nameservers included)
+✓ 2GB Swap (RAM overflow protection)
+
 Useful Commands:
-- Restart proxy: systemctl restart 3proxy
-- Check status: systemctl status 3proxy
-- Stop proxy: systemctl stop 3proxy
-- Start proxy: systemctl start 3proxy
-- View logs: journalctl -u 3proxy -f
-- Check memory: ps aux | grep 3proxy
-- Check connections: ss -tn | grep :$HTTP_PORT | wc -l
+- Restart  : systemctl restart 3proxy
+- Status   : systemctl status 3proxy
+- Logs     : journalctl -u 3proxy -f
+- Monitor  : /root/monitor_proxy.sh
+- Diagnose : /root/diagnose_proxy.sh
 
-Test Commands:
-- Test HTTP: curl -x http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT http://ifconfig.me
-
-Configuration file: $PROXY_CFG
-
-Monitoring:
-- Memory usage: free -h
-- File limits: cat /proc/\$(pgrep 3proxy)/limits | grep "open files"
-- DNS check: nslookup google.com 1.1.1.1
-
-Note: All fixes applied for long-term stability:
-✓ DNS persistence configured
-✓ File limits set to 100000
-✓ Memory optimizations applied
-✓ Service auto-restart enabled
+Test:
+curl -x http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT http://ifconfig.me
 EOF
 
     chmod 600 "$DETAILS_FILE"
@@ -793,51 +807,50 @@ create_monitoring_script() {
 
     cat > /root/monitor_proxy.sh <<'EOF'
 #!/bin/bash
-
-# 3proxy Monitoring Script
-
 echo "╔════════════════════════════════════╗"
-echo "║     3proxy Status Monitor          ║"
+echo "║     3proxy Status Monitor v4.0     ║"
 echo "╚════════════════════════════════════╝"
-echo ""
 echo "Timestamp: $(date)"
 echo ""
 
-# Service Status
 echo "━━━ Service Status ━━━"
 if systemctl is-active --quiet 3proxy; then
     echo "✓ Service: Running"
-    UPTIME=$(systemctl show 3proxy --property=ActiveEnterTimestamp --value)
-    echo "  Uptime: Started at $UPTIME"
+    echo "  Started: $(systemctl show 3proxy --property=ActiveEnterTimestamp --value)"
 else
     echo "✗ Service: Stopped"
 fi
 echo ""
 
-# Memory Usage
-echo "━━━ Memory Usage ━━━"
-MEMORY=$(ps aux | grep 3proxy | grep -v grep | awk '{print $6/1024}')
-MEMORY_PERCENT=$(ps aux | grep 3proxy | grep -v grep | awk '{print $4}')
-echo "3proxy: ${MEMORY} MB (${MEMORY_PERCENT}%)"
-free -h | grep Mem
-echo ""
-
-# Connections
-echo "━━━ Active Connections ━━━"
-CONNECTIONS=$(ss -tn 2>/dev/null | grep :3128 | wc -l)
-echo "Active connections: $CONNECTIONS"
-echo ""
-
-# File Limits
-echo "━━━ File Limits ━━━"
-if pgrep 3proxy > /dev/null; then
-    cat /proc/$(pgrep 3proxy)/limits | grep "open files"
+echo "━━━ Conntrack (ROOT FIX) ━━━"
+CURRENT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "N/A")
+MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "N/A")
+echo "Usage: $CURRENT / $MAX"
+if [ "$MAX" != "N/A" ] && [ "$CURRENT" -gt $(( MAX * 80 / 100 )) ]; then
+    echo "⚠ WARNING: Conntrack table >80% full!"
 else
-    echo "3proxy not running"
+    echo "✓ Conntrack healthy"
 fi
 echo ""
 
-# DNS Check
+echo "━━━ TCP States ━━━"
+ss -ant | awk '{print $1}' | sort | uniq -c | sort -nr
+echo ""
+
+echo "━━━ 3proxy Resources ━━━"
+MEMORY=$(ps aux | grep 3proxy | grep -v grep | awk '{print $6/1024}')
+MEMORY_PCT=$(ps aux | grep 3proxy | grep -v grep | awk '{print $4}')
+THREADS=$(ps -T -p $(pgrep 3proxy) 2>/dev/null | wc -l)
+echo "Memory : ${MEMORY} MB (${MEMORY_PCT}%)"
+echo "Threads: $THREADS"
+free -h | grep Mem
+echo ""
+
+echo "━━━ Active Connections ━━━"
+echo "Total  : $(ss -ant | grep -c ESTAB)"
+echo "Port   : $(ss -ant | grep ":3128" | grep -c ESTAB)"
+echo ""
+
 echo "━━━ DNS Status ━━━"
 if nslookup google.com 1.1.1.1 > /dev/null 2>&1; then
     echo "✓ DNS: Working"
@@ -846,53 +859,48 @@ else
 fi
 echo ""
 
-# Port Check
-echo "━━━ Port Status ━━━"
-ss -tuln | grep :3128 || echo "Port 3128 not listening"
-echo ""
-
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 EOF
 
     chmod +x /root/monitor_proxy.sh
-    print_success "Monitoring script created: /root/monitor_proxy.sh"
+    print_success "Monitoring script: /root/monitor_proxy.sh"
 
     echo -n "Creating diagnostic script... "
 
     cat > /root/diagnose_proxy.sh <<'EOF'
 #!/bin/bash
-
-# Quick diagnostic and fix script
-
 echo "Running diagnostics..."
 echo ""
 
 # Check service
 if ! systemctl is-active --quiet 3proxy; then
-    echo "⚠ Service not running. Attempting restart..."
+    echo "⚠ Service not running. Restarting..."
     systemctl restart 3proxy
     sleep 2
 fi
 
-# Check DNS
-if ! nslookup google.com 1.1.1.1 > /dev/null 2>&1; then
-    echo "⚠ DNS issue detected. Fixing..."
-    cat > /etc/resolv.conf <<DNSEOF
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-DNSEOF
+# Check conntrack
+CURRENT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "0")
+MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "262144")
+if [ "$CURRENT" -gt $(( MAX * 80 / 100 )) ]; then
+    echo "⚠ Conntrack table >80%! Flushing..."
+    conntrack -F > /dev/null 2>&1 || true
 fi
 
-# Check memory
-MEMORY_PERCENT=$(ps aux | grep 3proxy | grep -v grep | awk '{print $4}' | cut -d'.' -f1)
-if [ "$MEMORY_PERCENT" -gt 50 ]; then
-    echo "⚠ High memory usage ($MEMORY_PERCENT%). Consider restarting."
+# Check DNS
+if ! nslookup google.com 1.1.1.1 > /dev/null 2>&1; then
+    echo "⚠ DNS issue detected."
 fi
 
 # Test proxy
 echo ""
 echo "Testing proxy..."
-if curl -s -x http://test:123@127.0.0.1:3128 --max-time 5 http://ifconfig.me > /dev/null 2>&1; then
+CFG_USER=$(grep "^users" /etc/3proxy/3proxy.cfg | cut -d: -f1 | awk '{print $2}')
+CFG_PASS=$(grep "^users" /etc/3proxy/3proxy.cfg | awk -F: '{print $3}')
+CFG_PORT=$(grep "^proxy" /etc/3proxy/3proxy.cfg | grep -oP '(?<=-p)\d+')
+
+if curl -s -x "http://$CFG_USER:$CFG_PASS@127.0.0.1:$CFG_PORT" \
+        --max-time 10 http://ifconfig.me > /dev/null 2>&1; then
     echo "✓ Proxy is working"
 else
     echo "✗ Proxy test failed"
@@ -903,7 +911,7 @@ echo "Run '/root/monitor_proxy.sh' for detailed status"
 EOF
 
     chmod +x /root/diagnose_proxy.sh
-    print_success "Diagnostic script created: /root/diagnose_proxy.sh"
+    print_success "Diagnostic script: /root/diagnose_proxy.sh"
 
     echo ""
 }
@@ -931,13 +939,10 @@ display_results() {
     echo ""
     echo -e "${CYAN}Details saved to:${NC} /root/proxy_details.txt"
     if [ "$USE_NAT" = true ]; then
-        echo -e "${CYAN}Environment:${NC} NAT (AWS/Cloud compatible)"
+        echo -e "${CYAN}Environment  :${NC} NAT (AWS/Cloud compatible)"
     else
-        echo -e "${CYAN}Environment:${NC} Direct IP"
+        echo -e "${CYAN}Environment  :${NC} Direct IP"
     fi
-    echo -e "${CYAN}Logging:${NC} Disabled (saves disk space)"
-    echo -e "${CYAN}DNS:${NC} Fixed (1.1.1.1, 8.8.8.8)"
-    echo -e "${CYAN}File Limits:${NC} 100000 (high performance)"
     echo ""
     print_separator
     echo -e "${BOLD}Useful commands:${NC}"
@@ -948,19 +953,21 @@ display_results() {
     echo "  Diagnose      : /root/diagnose_proxy.sh"
     print_separator
     echo ""
-    echo -e "${BOLD}${GREEN}Improvements in v2.0 (Xrumer Optimized):${NC}"
-    echo "  ✓ Timeouts synced to 110s (Matches Xrumer 100s limit)"
-    echo "  ✓ 2GB Swap Memory added to prevent RAM crashes"
-    echo "  ✓ Kernel TCP Fast-Fail enabled (Kills dead connections)"
-    echo "  ✓ DNS Cache reduced to 8192 to save RAM"
-    echo "  ✓ Max connections increased to 5000"
+    echo -e "${BOLD}${GREEN}Fixes applied in v4.0:${NC}"
+    echo "  ✓ nf_conntrack_max=262144 (ROOT FIX - silent packet drops eliminated)"
+    echo "  ✓ tcp_syn_retries=1 (dead servers cleaned in 3s not 130s)"
+    echo "  ✓ DNS bottleneck removed (OS handles DNS, not 3proxy)"
+    echo "  ✓ ClientIdle=600s (XEvil captcha 250s+ safe)"
+    echo "  ✓ ServerConnect=30s (slow-but-alive forums included)"
+    echo "  ✓ Resolve=15s (slow DNS nameservers handled)"
+    echo "  ✓ 2GB Swap added (RAM overflow protection)"
     echo ""
     print_separator
     echo ""
 }
 
 #############################################
-# Main Installation Flow
+# Main
 #############################################
 
 main() {
@@ -975,15 +982,15 @@ main() {
     echo ""
 
     check_existing_installation
-
-    get_user_input
     detect_nat_environment
+    get_user_input
     confirm_installation
 
     setup_swap
     install_dependencies
     install_3proxy
     configure_dns
+    configure_system
     configure_3proxy
     configure_firewall
     setup_service
@@ -999,5 +1006,4 @@ main() {
     echo ""
 }
 
-# Run main function
 main

@@ -31,16 +31,25 @@ SQUID_SRC_DIR="/usr/local/src/squid-build"
 SQUID_PASSWD_FILE="/etc/squid/passwd"
 
 SERVER_IP=""
-PROXY_USER=""
-PROXY_PASS=""
-HTTP_PORT="$DEFAULT_PORT"
+PROXY_USER="${PROXY_USER:-}"
+PROXY_PASS="${PROXY_PASS:-}"
+HTTP_PORT="${HTTP_PORT:-$DEFAULT_PORT}"
 SQUID_WORKERS="1"
 RECOMMENDED_CONCURRENCY="80"
 BUILD_JOBS="1"
 SQUID_VERSION=""
+AUTO_YES="${AUTO_YES:-0}"
+
+if [ -t 0 ] && [ -t 1 ]; then
+    INTERACTIVE=1
+else
+    INTERACTIVE=0
+fi
 
 print_header() {
-    clear
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        clear || true
+    fi
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo -e "${CYAN}|${NC} ${BOLD}Squid Forward Proxy Setup v4.0${NC}               ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC} Latest Squid v7 + stability hardening          ${CYAN}|${NC}"
@@ -104,9 +113,16 @@ detect_network() {
 
 choose_capacity_defaults() {
     local total_ram_mb
-    total_ram_mb=$(free -m | awk '/^Mem:/{print $2}')
+    total_ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2; exit}' || true)
+    if ! [[ "$total_ram_mb" =~ ^[0-9]+$ ]]; then
+        total_ram_mb=1024
+    fi
+
     local cpu_count
-    cpu_count=$(nproc)
+    cpu_count=$(nproc 2>/dev/null || true)
+    if ! [[ "$cpu_count" =~ ^[0-9]+$ ]]; then
+        cpu_count=1
+    fi
 
     if [ "$total_ram_mb" -le 1024 ]; then
         SQUID_WORKERS=1
@@ -134,36 +150,67 @@ get_user_input() {
     echo -e "${BOLD}Configuration${NC}"
     echo ""
 
-    while true; do
-        read -r -p "Proxy username: " PROXY_USER
-        [ -n "$PROXY_USER" ] && break
-        print_error "Username cannot be empty"
-    done
-
-    while true; do
-        read -r -s -p "Proxy password: " PROXY_PASS
-        echo ""
-        if [ -z "$PROXY_PASS" ]; then
-            print_error "Password cannot be empty"
-            continue
-        fi
-        read -r -s -p "Confirm password: " PROXY_PASS_CONFIRM
-        echo ""
-        if [ "$PROXY_PASS" != "$PROXY_PASS_CONFIRM" ]; then
-            print_error "Passwords do not match"
+    if [ -z "$PROXY_USER" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            while true; do
+                if ! read -r -p "Proxy username: " PROXY_USER; then
+                    error_exit "Input stream closed while reading username"
+                fi
+                [ -n "$PROXY_USER" ] && break
+                print_error "Username cannot be empty"
+            done
         else
-            break
+            error_exit "PROXY_USER is required in non-interactive mode"
         fi
-    done
+    fi
 
-    while true; do
-        read -r -p "HTTP port [$DEFAULT_PORT]: " HTTP_PORT
-        HTTP_PORT=${HTTP_PORT:-$DEFAULT_PORT}
-        if [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] && [ "$HTTP_PORT" -ge 1024 ] && [ "$HTTP_PORT" -le 65535 ]; then
-            break
+    if [ -z "$PROXY_PASS" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            while true; do
+                if ! read -r -s -p "Proxy password: " PROXY_PASS; then
+                    echo ""
+                    error_exit "Input stream closed while reading password"
+                fi
+                echo ""
+                if [ -z "$PROXY_PASS" ]; then
+                    print_error "Password cannot be empty"
+                    continue
+                fi
+
+                local proxy_pass_confirm
+                if ! read -r -s -p "Confirm password: " proxy_pass_confirm; then
+                    echo ""
+                    error_exit "Input stream closed while confirming password"
+                fi
+                echo ""
+
+                if [ "$PROXY_PASS" != "$proxy_pass_confirm" ]; then
+                    print_error "Passwords do not match"
+                else
+                    break
+                fi
+            done
+        else
+            error_exit "PROXY_PASS is required in non-interactive mode"
         fi
-        print_error "Invalid port. Must be 1024-65535"
-    done
+    fi
+
+    if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            while true; do
+                if ! read -r -p "HTTP port [$DEFAULT_PORT]: " HTTP_PORT; then
+                    error_exit "Input stream closed while reading port"
+                fi
+                HTTP_PORT=${HTTP_PORT:-$DEFAULT_PORT}
+                if [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] && [ "$HTTP_PORT" -ge 1024 ] && [ "$HTTP_PORT" -le 65535 ]; then
+                    break
+                fi
+                print_error "Invalid port. Must be 1024-65535"
+            done
+        else
+            error_exit "HTTP_PORT must be a valid integer between 1024-65535"
+        fi
+    fi
 
     echo ""
     echo -e "${BOLD}Installation Summary:${NC}"
@@ -177,11 +224,20 @@ get_user_input() {
     echo "  Recommended concurrency: $RECOMMENDED_CONCURRENCY"
     echo ""
 
-    read -r -p "Proceed? (y/n): " -n 1 REPLY
-    echo ""
-    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-        echo "Cancelled."
-        exit 0
+    if [ "$AUTO_YES" = "1" ]; then
+        print_info "AUTO_YES=1 set, proceeding without confirmation"
+    elif [ "$INTERACTIVE" -eq 1 ]; then
+        if ! read -r -p "Proceed? (y/n): " -n 1 REPLY; then
+            echo ""
+            error_exit "Input stream closed while waiting for confirmation"
+        fi
+        echo ""
+        if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+    else
+        error_exit "Non-interactive mode requires AUTO_YES=1"
     fi
     echo ""
 }

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
-set -uo pipefail
+set -euo pipefail
 
 #############################################
 # Squid Forward Proxy Setup Script v4.0
 # Stable + modern build for forum checker
 #
 # Key fixes vs v3:
-# - Builds latest Squid v7 from source (avoids distro 5.x lock-in)
+# - Builds latest supported Squid from source (prefers stable releases)
 # - half_closed_clients OFF (default, safer for forward proxy)
 # - pipeline_prefetch OFF (avoid risky connection behavior)
 # - Uses system DNS resolver (no hardcoded public DNS)
@@ -23,7 +23,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.0.2"
+SCRIPT_REV="v4.0.3"
 SQUID_PREFIX="/usr/local/squid"
 SQUID_ETC_DIR="/etc/squid"
 SQUID_LOG_DIR="/var/log/squid"
@@ -39,6 +39,8 @@ SQUID_WORKERS="1"
 RECOMMENDED_CONCURRENCY="80"
 BUILD_JOBS="1"
 SQUID_VERSION=""
+SQUID_SERIES=""
+SQUID_TARBALL_EXT=""
 AUTO_YES="${AUTO_YES:-0}"
 
 if [ -t 0 ] && [ -t 1 ]; then
@@ -59,7 +61,7 @@ print_header() {
     fi
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo -e "${CYAN}|${NC} ${BOLD}Squid Forward Proxy Setup ${SCRIPT_REV}${NC}             ${CYAN}|${NC}"
-    echo -e "${CYAN}|${NC} Latest Squid v7 + stability hardening          ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC} Latest Squid + stability hardening             ${CYAN}|${NC}"
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo ""
 }
@@ -346,22 +348,55 @@ stop_old_squid() {
     echo ""
 }
 
-discover_latest_v7() {
-    local page
-    page=$(curl -fsSL "https://www.squid-cache.org/Versions/v7/")
+choose_tar_ext_from_page() {
+    local page="$1"
+    local version="$2"
 
-    local latest
-    latest=$(printf '%s\n' "$page" | sed -n 's/.*href="squid-\(7\.[0-9.]*\)\.tar\.xz".*/\1/p' | sort -V | tail -n1)
+    local ext
+    for ext in xz gz bz2; do
+        if printf '%s\n' "$page" | grep -q "squid-${version}\\.tar\\.${ext}"; then
+            SQUID_TARBALL_EXT="$ext"
+            return 0
+        fi
+    done
 
-    if [ -z "$latest" ]; then
-        latest=$(printf '%s\n' "$page" | sed -n 's/.*href="squid-\(7\.[0-9.]*\)\.tar\.gz".*/\1/p' | sort -V | tail -n1)
+    return 1
+}
+
+discover_latest_squid_release() {
+    local page_v7 page_v6
+    page_v7=$(curl -fsSL "https://www.squid-cache.org/Versions/v7/")
+    page_v6=$(curl -fsSL "https://www.squid-cache.org/Versions/v6/")
+
+    local latest_stable_v7 latest_stable_v6 latest_dev_v7
+
+    latest_stable_v7=$(printf '%s\n' "$page_v7" | sed -n 's/.*href="squid-\(7\.[0-9][0-9.]*\)\.tar\.\(xz\|gz\|bz2\)".*/\1/p' | sort -V -u | tail -n1)
+    latest_stable_v6=$(printf '%s\n' "$page_v6" | sed -n 's/.*href="squid-\(6\.[0-9][0-9.]*\)\.tar\.\(xz\|gz\|bz2\)".*/\1/p' | sort -V -u | tail -n1)
+    latest_dev_v7=$(printf '%s\n' "$page_v7" | sed -n 's/.*href="squid-\(7\.[0-9][0-9A-Za-z._-]*\)\.tar\.\(xz\|gz\|bz2\)".*/\1/p' | sort -V -u | tail -n1)
+
+    if [ -n "$latest_stable_v7" ]; then
+        SQUID_SERIES="v7"
+        SQUID_VERSION="$latest_stable_v7"
+        choose_tar_ext_from_page "$page_v7" "$SQUID_VERSION" || error_exit "Could not determine tar extension for Squid $SQUID_VERSION"
+        return 0
     fi
 
-    if [ -z "$latest" ]; then
-        error_exit "Could not detect latest Squid v7 version from squid-cache.org"
+    if [ -n "$latest_stable_v6" ]; then
+        SQUID_SERIES="v6"
+        SQUID_VERSION="$latest_stable_v6"
+        choose_tar_ext_from_page "$page_v6" "$SQUID_VERSION" || error_exit "Could not determine tar extension for Squid $SQUID_VERSION"
+        return 0
     fi
 
-    SQUID_VERSION="$latest"
+    if [ -n "$latest_dev_v7" ]; then
+        SQUID_SERIES="v7"
+        SQUID_VERSION="$latest_dev_v7"
+        choose_tar_ext_from_page "$page_v7" "$SQUID_VERSION" || error_exit "Could not determine tar extension for Squid $SQUID_VERSION"
+        print_warning "No stable v7 release found; using latest v7 daily build: $SQUID_VERSION"
+        return 0
+    fi
+
+    error_exit "Could not detect any supported Squid release from squid-cache.org"
 }
 
 build_squid() {
@@ -369,14 +404,14 @@ build_squid() {
     echo -e "${BOLD}Building Squid from source...${NC}"
     echo ""
 
-    discover_latest_v7
-    print_info "Latest detected Squid v7: $SQUID_VERSION"
+    discover_latest_squid_release
+    print_info "Selected Squid release: $SQUID_VERSION ($SQUID_SERIES, tar.$SQUID_TARBALL_EXT)"
 
     mkdir -p "$SQUID_SRC_DIR"
     rm -rf "$SQUID_SRC_DIR"/*
 
-    local tarball="squid-${SQUID_VERSION}.tar.xz"
-    local url="https://www.squid-cache.org/Versions/v7/${tarball}"
+    local tarball="squid-${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+    local url="https://www.squid-cache.org/Versions/${SQUID_SERIES}/${tarball}"
 
     echo -n "Downloading ${tarball}... "
     curl -fsSL "$url" -o "$SQUID_SRC_DIR/$tarball"

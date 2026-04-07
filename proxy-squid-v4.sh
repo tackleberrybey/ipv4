@@ -142,7 +142,11 @@ choose_capacity_defaults() {
         BUILD_JOBS=$(( cpu_count > 4 ? 4 : cpu_count ))
     fi
 
-    [ "$BUILD_JOBS" -lt 1 ] && BUILD_JOBS=1
+    if [ "$BUILD_JOBS" -lt 1 ]; then
+        BUILD_JOBS=1
+    fi
+
+    return 0
 }
 
 get_user_input() {

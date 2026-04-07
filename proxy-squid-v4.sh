@@ -3,7 +3,7 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.0
+# Squid Forward Proxy Setup Script v4.1.0
 # Stable + modern build for forum checker
 #
 # Key fixes vs v3:
@@ -89,6 +89,50 @@ run_step() {
     if [ "$rc" -ne 0 ]; then
         error_exit "Step failed: $step_name (exit $rc)"
     fi
+}
+
+run_logged_command() {
+    local label="$1"
+    local logfile="$2"
+    shift 2
+
+    : > "$logfile"
+    "$@" > "$logfile" 2>&1 &
+    local cmd_pid=$!
+    local start_ts=$SECONDS
+    local last_size=0
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        sleep 15
+
+        local elapsed=$(( SECONDS - start_ts ))
+        local current_size=0
+        if [ -f "$logfile" ]; then
+            current_size=$(wc -c < "$logfile" 2>/dev/null || printf '0')
+        fi
+
+        if [ "$current_size" -gt "$last_size" ]; then
+            printf "\r%s... %ss elapsed, build log growing (%s bytes)" "$label" "$elapsed" "$current_size"
+            last_size=$current_size
+        else
+            printf "\r%s... %ss elapsed, still running               " "$label" "$elapsed"
+        fi
+    done
+
+    wait "$cmd_pid"
+    local rc=$?
+    local total_elapsed=$(( SECONDS - start_ts ))
+    printf "\r"
+
+    if [ "$rc" -ne 0 ]; then
+        print_error "$label failed after ${total_elapsed}s. See $logfile"
+        echo ""
+        echo "Last 40 log lines:"
+        tail -n 40 "$logfile" || true
+        return "$rc"
+    fi
+
+    print_success "Done (${total_elapsed}s)"
 }
 
 prompt_read() {
@@ -387,7 +431,7 @@ build_squid() {
     cd "$SQUID_SRC_DIR/squid-${SQUID_VERSION}"
 
     echo -n "Configuring build... "
-    ./configure \
+    run_logged_command "Configuring build" "/tmp/squid-configure.log" ./configure \
         --prefix="$SQUID_PREFIX" \
         --sysconfdir="$SQUID_ETC_DIR" \
         --localstatedir=/var \
@@ -396,26 +440,23 @@ build_squid() {
         --with-openssl \
         --enable-auth-basic=NCSA \
         --disable-translation \
-        --with-filedescriptors=100000 \
-        > /tmp/squid-configure.log 2>&1 || {
+        --with-filedescriptors=100000 || {
         print_error "Configure failed. See /tmp/squid-configure.log"
         exit 1
     }
-    print_success "Done"
 
+    print_info "Compilation can stay CPU-bound and quiet for several minutes on small servers"
     echo -n "Compiling (jobs=$BUILD_JOBS)... "
-    make -j"$BUILD_JOBS" > /tmp/squid-build.log 2>&1 || {
+    run_logged_command "Compiling (jobs=$BUILD_JOBS)" "/tmp/squid-build.log" make -j"$BUILD_JOBS" || {
         print_error "Build failed. See /tmp/squid-build.log"
         exit 1
     }
-    print_success "Done"
 
     echo -n "Installing... "
-    make install > /tmp/squid-install.log 2>&1 || {
+    run_logged_command "Installing" "/tmp/squid-install.log" make install || {
         print_error "Install failed. See /tmp/squid-install.log"
         exit 1
     }
-    print_success "Done"
 
     print_success "Installed Squid ${SQUID_VERSION} at ${SQUID_PREFIX}"
     echo ""
@@ -446,7 +487,7 @@ write_squid_config() {
     echo ""
 
     cat > "$SQUID_ETC_DIR/squid.conf" <<EOF
-# Squid Forward Proxy v4.0
+# Squid Forward Proxy ${SCRIPT_REV}
 # Focus: stability under high CONNECT concurrency
 
 workers $SQUID_WORKERS
@@ -682,7 +723,7 @@ EOF
 
 save_details() {
     cat > /root/proxy_details.txt <<EOF
-Squid Forward Proxy v4.0
+Squid Forward Proxy ${SCRIPT_REV}
 ========================
 
 Squid version: $SQUID_VERSION

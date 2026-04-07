@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+set -uo pipefail
 
 #############################################
 # Squid Forward Proxy Setup Script v4.0
@@ -23,6 +23,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
+SCRIPT_REV="v4.0.2"
 SQUID_PREFIX="/usr/local/squid"
 SQUID_ETC_DIR="/etc/squid"
 SQUID_LOG_DIR="/var/log/squid"
@@ -46,12 +47,18 @@ else
     INTERACTIVE=0
 fi
 
+if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    TTY_AVAILABLE=1
+else
+    TTY_AVAILABLE=0
+fi
+
 print_header() {
     if [ "$INTERACTIVE" -eq 1 ]; then
         clear || true
     fi
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
-    echo -e "${CYAN}|${NC} ${BOLD}Squid Forward Proxy Setup v4.0${NC}               ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC} ${BOLD}Squid Forward Proxy Setup ${SCRIPT_REV}${NC}             ${CYAN}|${NC}"
     echo -e "${CYAN}|${NC} Latest Squid v7 + stability hardening          ${CYAN}|${NC}"
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo ""
@@ -66,6 +73,39 @@ print_info()      { echo -e "${CYAN}[INFO]${NC} $1"; }
 error_exit() {
     print_error "$1"
     exit 1
+}
+
+run_step() {
+    local step_name="$1"
+    shift
+
+    "$@"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        error_exit "Step failed: $step_name (exit $rc)"
+    fi
+}
+
+prompt_read() {
+    local prompt="$1"
+    local var_name="$2"
+
+    if [ "$TTY_AVAILABLE" -eq 1 ]; then
+        read -r -p "$prompt" "$var_name" < /dev/tty
+    else
+        read -r -p "$prompt" "$var_name"
+    fi
+}
+
+prompt_read_silent() {
+    local prompt="$1"
+    local var_name="$2"
+
+    if [ "$TTY_AVAILABLE" -eq 1 ]; then
+        read -r -s -p "$prompt" "$var_name" < /dev/tty
+    else
+        read -r -s -p "$prompt" "$var_name"
+    fi
 }
 
 check_root() {
@@ -157,7 +197,7 @@ get_user_input() {
     if [ -z "$PROXY_USER" ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             while true; do
-                if ! read -r -p "Proxy username: " PROXY_USER; then
+                if ! prompt_read "Proxy username: " PROXY_USER; then
                     error_exit "Input stream closed while reading username"
                 fi
                 [ -n "$PROXY_USER" ] && break
@@ -171,7 +211,7 @@ get_user_input() {
     if [ -z "$PROXY_PASS" ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             while true; do
-                if ! read -r -s -p "Proxy password: " PROXY_PASS; then
+                if ! prompt_read_silent "Proxy password: " PROXY_PASS; then
                     echo ""
                     error_exit "Input stream closed while reading password"
                 fi
@@ -182,7 +222,7 @@ get_user_input() {
                 fi
 
                 local proxy_pass_confirm
-                if ! read -r -s -p "Confirm password: " proxy_pass_confirm; then
+                if ! prompt_read_silent "Confirm password: " proxy_pass_confirm; then
                     echo ""
                     error_exit "Input stream closed while confirming password"
                 fi
@@ -202,7 +242,7 @@ get_user_input() {
     if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
             while true; do
-                if ! read -r -p "HTTP port [$DEFAULT_PORT]: " HTTP_PORT; then
+                if ! prompt_read "HTTP port [$DEFAULT_PORT]: " HTTP_PORT; then
                     error_exit "Input stream closed while reading port"
                 fi
                 HTTP_PORT=${HTTP_PORT:-$DEFAULT_PORT}
@@ -231,7 +271,12 @@ get_user_input() {
     if [ "$AUTO_YES" = "1" ]; then
         print_info "AUTO_YES=1 set, proceeding without confirmation"
     elif [ "$INTERACTIVE" -eq 1 ]; then
-        if ! read -r -p "Proceed? (y/n): " -n 1 REPLY; then
+        if [ "$TTY_AVAILABLE" -eq 1 ]; then
+            read -r -p "Proceed? (y/n): " -n 1 REPLY < /dev/tty || {
+                echo ""
+                error_exit "Input stream closed while waiting for confirmation"
+            }
+        elif ! read -r -p "Proceed? (y/n): " -n 1 REPLY; then
             echo ""
             error_exit "Input stream closed while waiting for confirmation"
         fi
@@ -683,25 +728,25 @@ display_results() {
 }
 
 main() {
-    print_header
-    check_root
-    check_os
-    detect_network
-    choose_capacity_defaults
-    get_user_input
-    setup_swap
-    install_prerequisites
-    stop_old_squid
-    build_squid
-    prepare_runtime
-    write_squid_config
-    write_sysctl_profile
-    write_systemd_unit
-    configure_firewall
-    start_and_validate
-    create_monitor_script
-    save_details
-    display_results
+    run_step "print_header" print_header
+    run_step "check_root" check_root
+    run_step "check_os" check_os
+    run_step "detect_network" detect_network
+    run_step "choose_capacity_defaults" choose_capacity_defaults
+    run_step "get_user_input" get_user_input
+    run_step "setup_swap" setup_swap
+    run_step "install_prerequisites" install_prerequisites
+    run_step "stop_old_squid" stop_old_squid
+    run_step "build_squid" build_squid
+    run_step "prepare_runtime" prepare_runtime
+    run_step "write_squid_config" write_squid_config
+    run_step "write_sysctl_profile" write_sysctl_profile
+    run_step "write_systemd_unit" write_systemd_unit
+    run_step "configure_firewall" configure_firewall
+    run_step "start_and_validate" start_and_validate
+    run_step "create_monitor_script" create_monitor_script
+    run_step "save_details" save_details
+    run_step "display_results" display_results
 }
 
 main "$@"

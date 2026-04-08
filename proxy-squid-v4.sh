@@ -925,11 +925,13 @@ start_and_validate() {
         print_success "No assertion detected in startup logs"
     fi
 
-    # Verify jemalloc is loaded — wait up to 10s for squid-1 child to spawn
+    # Verify jemalloc is loaded
+    # pgrep -f "squid-1" also matches the master process cmdline; use "--kid squid-1"
+    # to target only the worker child which actually has LD_PRELOAD applied.
     local squid_pid=""
     local wait_i
     for wait_i in 1 2 3 4 5; do
-        squid_pid=$(pgrep -f "squid-1" | head -1 || true)
+        squid_pid=$(pgrep -f -- "--kid squid-1" | head -1 || true)
         [ -n "$squid_pid" ] && break
         sleep 2
     done
@@ -941,6 +943,9 @@ start_and_validate() {
         else
             print_warning "jemalloc NOT detected in squid-1 maps — glibc malloc in use (memory may grow unbounded)"
         fi
+    else
+        print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
+    fi
     else
         print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
     fi
@@ -964,7 +969,7 @@ echo "Workers:"
 ps -eo pid,ppid,%cpu,%mem,rss,etime,cmd | grep '[s]quid' || true
 echo ""
 echo "jemalloc:"
-SQUID_PID=$(pgrep -f "squid-1" | head -1 || true)
+SQUID_PID=$(pgrep -f -- "--kid squid-1" | head -1 || true)
 if [ -n "$SQUID_PID" ]; then
     if grep -q "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null; then
         JEMALLOC_PATH=$(grep "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null | awk '{print $NF}' | head -1)

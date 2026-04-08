@@ -925,17 +925,24 @@ start_and_validate() {
         print_success "No assertion detected in startup logs"
     fi
 
-    # Verify jemalloc is loaded
-    local squid_pid
-    squid_pid=$(pgrep -f "squid-1" | head -1 || true)
+    # Verify jemalloc is loaded — wait up to 10s for squid-1 child to spawn
+    local squid_pid=""
+    local wait_i
+    for wait_i in 1 2 3 4 5; do
+        squid_pid=$(pgrep -f "squid-1" | head -1 || true)
+        [ -n "$squid_pid" ] && break
+        sleep 2
+    done
     if [ -n "$squid_pid" ]; then
         if grep -q "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null; then
             local jemalloc_path
             jemalloc_path=$(grep "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
-            print_success "jemalloc confirmed loaded in squid-1 process ($jemalloc_path)"
+            print_success "jemalloc confirmed loaded in squid-1 (PID=$squid_pid, $jemalloc_path)"
         else
             print_warning "jemalloc NOT detected in squid-1 maps — glibc malloc in use (memory may grow unbounded)"
         fi
+    else
+        print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
     fi
 
     echo ""

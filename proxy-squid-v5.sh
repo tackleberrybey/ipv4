@@ -926,25 +926,24 @@ start_and_validate() {
     fi
 
     # Verify jemalloc is loaded
-    # pgrep -f "squid-1" also matches the master process cmdline; use "--kid squid-1"
-    # to target only the worker child which actually has LD_PRELOAD applied.
-    local squid_pid=""
+    # Check /proc/PID/maps for every squid-related process
+    local jemalloc_verified=0
     local wait_i
     for wait_i in 1 2 3 4 5; do
-        squid_pid=$(pgrep -f -- "--kid squid-1" | head -1 || true)
-        [ -n "$squid_pid" ] && break
+        local pid
+        for pid in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
+            if grep -q "libjemalloc" /proc/"$pid"/maps 2>/dev/null; then
+                local jemalloc_path
+                jemalloc_path=$(grep "libjemalloc" /proc/"$pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
+                print_success "jemalloc confirmed loaded (PID=$pid, $jemalloc_path)"
+                jemalloc_verified=1
+                break 2
+            fi
+        done
         sleep 2
     done
-    if [ -n "$squid_pid" ]; then
-        if grep -q "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null; then
-            local jemalloc_path
-            jemalloc_path=$(grep "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
-            print_success "jemalloc confirmed loaded in squid-1 (PID=$squid_pid, $jemalloc_path)"
-        else
-            print_warning "jemalloc NOT detected in squid-1 maps — glibc malloc in use (memory may grow unbounded)"
-        fi
-    else
-        print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
+    if [ "$jemalloc_verified" -eq 0 ]; then
+        print_warning "jemalloc NOT confirmed in any squid process — glibc malloc may be in use"
     fi
 
     echo ""
@@ -966,16 +965,17 @@ echo "Workers:"
 ps -eo pid,ppid,%cpu,%mem,rss,etime,cmd | grep '[s]quid' || true
 echo ""
 echo "jemalloc:"
-SQUID_PID=$(pgrep -f -- "--kid squid-1" | head -1 || true)
-if [ -n "$SQUID_PID" ]; then
-    if grep -q "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null; then
-        JEMALLOC_PATH=$(grep "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null | awk '{print $NF}' | head -1)
-        echo "  [OK] jemalloc loaded in squid-1 (PID=$SQUID_PID, path=$JEMALLOC_PATH)"
-    else
-        echo "  [WARN] jemalloc NOT loaded — glibc malloc in use (memory may grow unbounded)"
+JEMALLOC_OK=0
+for PID in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
+    if grep -q "libjemalloc" /proc/"$PID"/maps 2>/dev/null; then
+        JPATH=$(grep "libjemalloc" /proc/"$PID"/maps 2>/dev/null | awk '{print $NF}' | head -1)
+        echo "  [OK] jemalloc loaded (PID=$PID, path=$JPATH)"
+        JEMALLOC_OK=1
+        break
     fi
-else
-    echo "  squid-1 process not found"
+done
+if [ "$JEMALLOC_OK" -eq 0 ]; then
+    echo "  [WARN] jemalloc NOT loaded in any squid process"
 fi
 echo ""
 echo "Socket states on :$PORT"

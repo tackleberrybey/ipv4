@@ -41,10 +41,12 @@ HTTP_PORT="${HTTP_PORT:-$DEFAULT_PORT}"
 SQUID_WORKERS="1"
 RECOMMENDED_CONCURRENCY="80"
 BUILD_JOBS="1"
+AUTH_CHILDREN="8 startup=2 idle=1"
 SQUID_VERSION="${SQUID_VERSION:-$DEFAULT_SQUID_VERSION}"
 SQUID_SERIES="${SQUID_SERIES:-$DEFAULT_SQUID_SERIES}"
 SQUID_TARBALL_EXT="${SQUID_TARBALL_EXT:-$DEFAULT_SQUID_TARBALL_EXT}"
 AUTO_YES="${AUTO_YES:-0}"
+TARGET_NF_CONNTRACK_MAX="262144"
 
 if [ -t 0 ] && [ -t 1 ]; then
     INTERACTIVE=1
@@ -135,6 +137,37 @@ run_logged_command() {
     print_success "Done (${total_elapsed}s)"
 }
 
+read_proc_value() {
+    local path="$1"
+
+    if [ -r "$path" ]; then
+        tr -d '[:space:]' < "$path"
+        return 0
+    fi
+
+    return 1
+}
+
+verify_conntrack_tuning() {
+    local current_max
+    local current_count
+    local current_buckets
+
+    current_max=$(read_proc_value /proc/sys/net/netfilter/nf_conntrack_max || true)
+    current_count=$(read_proc_value /proc/sys/net/netfilter/nf_conntrack_count || true)
+    current_buckets=$(read_proc_value /proc/sys/net/netfilter/nf_conntrack_buckets || true)
+
+    if ! [[ "$current_max" =~ ^[0-9]+$ ]]; then
+        error_exit "Could not read live nf_conntrack_max after sysctl apply"
+    fi
+
+    print_info "Live conntrack values: max=$current_max count=${current_count:-unknown} buckets=${current_buckets:-unknown}"
+
+    if [ "$current_max" -lt "$TARGET_NF_CONNTRACK_MAX" ]; then
+        error_exit "nf_conntrack_max stayed at $current_max (expected at least $TARGET_NF_CONNTRACK_MAX). Check sysctl output above."
+    fi
+}
+
 prompt_read() {
     local prompt="$1"
     local var_name="$2"
@@ -217,18 +250,22 @@ choose_capacity_defaults() {
         SQUID_WORKERS=1
         RECOMMENDED_CONCURRENCY=80
         BUILD_JOBS=1
+        AUTH_CHILDREN="8 startup=2 idle=1"
     elif [ "$total_ram_mb" -le 2048 ]; then
         SQUID_WORKERS=2
         RECOMMENDED_CONCURRENCY=150
         BUILD_JOBS=1
+        AUTH_CHILDREN="16 startup=4 idle=2"
     elif [ "$total_ram_mb" -le 4096 ]; then
         SQUID_WORKERS=3
         RECOMMENDED_CONCURRENCY=250
         BUILD_JOBS=$(( cpu_count > 2 ? 2 : cpu_count ))
+        AUTH_CHILDREN="32 startup=8 idle=4"
     else
         SQUID_WORKERS=4
         RECOMMENDED_CONCURRENCY=400
         BUILD_JOBS=$(( cpu_count > 4 ? 4 : cpu_count ))
+        AUTH_CHILDREN="64 startup=16 idle=8"
     fi
 
     if [ "$BUILD_JOBS" -lt 1 ]; then
@@ -314,6 +351,7 @@ get_user_input() {
     echo "  Port                   : $HTTP_PORT"
     echo "  Squid workers          : $SQUID_WORKERS"
     echo "  Build jobs             : $BUILD_JOBS"
+    echo "  Auth children          : $AUTH_CHILDREN"
     echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
     echo "  Recommended concurrency: $RECOMMENDED_CONCURRENCY"
     echo ""
@@ -477,6 +515,24 @@ prepare_runtime() {
     chmod 640 "$SQUID_PASSWD_FILE"
     chown root:proxy "$SQUID_PASSWD_FILE" || true
 
+    # Logrotate for squid error log
+    cat > /etc/logrotate.d/squid-v4 <<'LOGROTATE'
+/var/log/squid/errors.log
+/var/log/squid/cache.log
+{
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 proxy proxy
+    postrotate
+        systemctl reload squid 2>/dev/null || true
+    endscript
+}
+LOGROTATE
+
     print_success "Runtime directories and credentials prepared"
     echo ""
 }
@@ -499,7 +555,7 @@ coredump_dir $SQUID_SPOOL_DIR
 
 # Authentication
 auth_param basic program $SQUID_PREFIX/libexec/basic_ncsa_auth $SQUID_PASSWD_FILE
-auth_param basic children 64 startup=16 idle=8
+auth_param basic children $AUTH_CHILDREN
 auth_param basic realm ForumCheckerProxy
 auth_param basic credentialsttl 24 hours
 acl authenticated proxy_auth REQUIRED
@@ -532,8 +588,9 @@ cache_mem 16 MB
 maximum_object_size 0 KB
 memory_pools off
 
-# Logs
-access_log none
+# Logs — only errors (avoids disk fill on high-volume checker workload)
+logformat squid_errors %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru
+access_log $SQUID_LOG_DIR/errors.log squid_errors ERR_
 cache_store_log none
 cache_log $SQUID_LOG_DIR/cache.log
 
@@ -548,7 +605,7 @@ shutdown_lifetime 3 seconds
 
 # Important stability defaults (v3 bugfix)
 half_closed_clients off
-pipeline_prefetch off
+pipeline_prefetch 0
 
 httpd_suppress_version_string on
 icp_port 0
@@ -578,7 +635,14 @@ net.netfilter.nf_conntrack_max = 262144
 vm.swappiness = 10
 EOF
 
-    sysctl --system > /dev/null 2>&1 || true
+    # Ensure nf_conntrack module is loaded now and persists across reboots
+    modprobe nf_conntrack 2>/dev/null || true
+    echo 'nf_conntrack' > /etc/modules-load.d/nf_conntrack.conf
+    print_info "nf_conntrack module loaded and persisted via /etc/modules-load.d/nf_conntrack.conf"
+
+    print_info "Applying sysctl profile from /etc/sysctl.d/99-squid-proxy-v4.conf"
+    sysctl --system
+    verify_conntrack_tuning
     conntrack -F > /dev/null 2>&1 || true
 
     cat > /etc/security/limits.d/squid-v4.conf <<'EOF'
@@ -708,14 +772,32 @@ echo "Socket states on :$PORT"
 ss -ant "( sport = :$PORT or dport = :$PORT )" | awk 'NR>1{c[$1]++} END{for (s in c) print s, c[s]}'
 echo ""
 echo "Kernel conntrack:"
-echo -n "count="; cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || true
-echo -n "max="; cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || true
+COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+MAX=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+BUCKETS=$(cat /proc/sys/net/netfilter/nf_conntrack_buckets 2>/dev/null || echo 0)
+echo "  count=$COUNT  max=$MAX  buckets=$BUCKETS"
+if [ "$MAX" -gt 0 ]; then
+    PCT=$(( COUNT * 100 / MAX ))
+    echo "  usage=$PCT%"
+    if [ "$PCT" -gt 80 ]; then
+        echo "  [WARN] conntrack table >80% full — risk of dropped connections"
+    fi
+fi
+echo ""
+echo "Recent conntrack drops (last 1h):"
+dmesg --since "1 hour ago" 2>/dev/null | grep -i "nf_conntrack.*full" | tail -5 || echo "  none"
+echo ""
+echo "Squid error/warn count (last 1h):"
+journalctl -u squid --since "1 hour ago" --no-pager 2>/dev/null | grep -cE "ERR|WARN|assert" || echo "  0"
 echo ""
 echo "Recent squid assertions:"
-journalctl -u squid -n 200 --no-pager | grep -E "assertion failed|will not be restarted" || echo "none"
+journalctl -u squid -n 200 --no-pager | grep -E "assertion failed|will not be restarted" || echo "  none"
 echo ""
-echo "Cache log tail:"
-tail -n 20 /var/log/squid/cache.log 2>/dev/null || true
+echo "Error log tail (last 20 lines):"
+tail -n 20 /var/log/squid/errors.log 2>/dev/null || echo "  (no errors.log yet)"
+echo ""
+echo "Cache log tail (last 10 lines):"
+tail -n 10 /var/log/squid/cache.log 2>/dev/null || true
 EOF
 
     chmod +x /root/monitor_squid_v4.sh

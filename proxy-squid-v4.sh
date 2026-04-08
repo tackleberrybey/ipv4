@@ -3,14 +3,17 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.1.0
-# Stable + modern build for forum checker
+# Squid Forward Proxy Setup Script v4.2.0
+# Stable + apt-based install for Ubuntu 24.04
 #
-# Key fixes vs v3:
-# - Pins Squid to a known-stable release (default: v6.12)
+# Key fixes vs v4.1:
+# - Ubuntu 24.04: installs Squid 6 via apt (no compile, ~2 min vs 15 min)
+# - Older Ubuntu/Debian: falls back to source compile
+# - Configures public DNS (1.1.1.1 8.8.8.8) via systemd-resolved or
+#   /etc/resolv.conf for reliable forum hostname resolution
+# - dns_nameservers directive in squid.conf
 # - half_closed_clients OFF (default, safer for forward proxy)
 # - pipeline_prefetch OFF (avoid risky connection behavior)
-# - Uses system DNS resolver (no hardcoded public DNS)
 # - Adds assert/crash smoke checks after startup
 #############################################
 
@@ -23,11 +26,12 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.1.0"
+SCRIPT_REV="v4.2.0"
 DEFAULT_SQUID_SERIES="v6"
 DEFAULT_SQUID_VERSION="6.12"
 DEFAULT_SQUID_TARBALL_EXT="xz"
 SQUID_PREFIX="/usr/local/squid"
+SQUID_LIBEXEC="/usr/local/squid/libexec"   # overridden by apt path
 SQUID_ETC_DIR="/etc/squid"
 SQUID_LOG_DIR="/var/log/squid"
 SQUID_SPOOL_DIR="/var/spool/squid"
@@ -350,9 +354,16 @@ get_user_input() {
     echo "  Password               : ${PROXY_PASS//?/*}"
     echo "  Port                   : $HTTP_PORT"
     echo "  Squid workers          : $SQUID_WORKERS"
-    echo "  Build jobs             : $BUILD_JOBS"
     echo "  Auth children          : $AUTH_CHILDREN"
-    echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+    if can_use_apt_squid6; then
+        echo "  Install method         : apt (Ubuntu 24.04 fast path, ~2 min)"
+        echo "  Squid version          : 6 (latest from apt)"
+    else
+        echo "  Install method         : source compile (~10-15 min)"
+        echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+        echo "  Build jobs             : $BUILD_JOBS"
+    fi
+    echo "  DNS                    : 1.1.1.1 8.8.8.8 8.8.4.4"
     echo "  Recommended concurrency: $RECOMMENDED_CONCURRENCY"
     echo ""
 
@@ -405,52 +416,70 @@ setup_swap() {
 
 install_prerequisites() {
     print_separator
-    echo -e "${BOLD}Installing build prerequisites...${NC}"
+    echo -e "${BOLD}Installing base prerequisites...${NC}"
     echo ""
 
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        build-essential pkg-config perl m4 \
-        libssl-dev libexpat1-dev libxml2-dev \
-        zlib1g-dev libcppunit-dev libecap3-dev \
-        libdb-dev libsasl2-dev libldap2-dev libpam0g-dev \
-        apache2-utils ca-certificates curl xz-utils tar \
+        apache2-utils ca-certificates curl \
         ufw conntrack
 
-    print_success "Dependencies installed"
+    print_success "Base prerequisites installed"
     echo ""
 }
 
-stop_old_squid() {
+# Returns 0 if we can use apt-based Squid 6 (Ubuntu 24.04+), 1 otherwise
+can_use_apt_squid6() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        local _id="${ID:-}"
+        local _ver="${VERSION_ID:-}"
+        if [ "$_id" = "ubuntu" ] && [ "${_ver%%.*}" -ge 24 ] 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+install_squid_apt() {
     print_separator
-    echo -e "${BOLD}Stopping old proxy services...${NC}"
+    echo -e "${BOLD}Installing Squid 6 via apt (Ubuntu 24.04)...${NC}"
     echo ""
 
-    systemctl stop squid > /dev/null 2>&1 || true
-    systemctl disable squid > /dev/null 2>&1 || true
-    pkill -9 squid > /dev/null 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq squid
 
-    print_success "Old squid processes stopped"
+    # Resolve the actual binary location — apt may put it at /usr/sbin/squid
+    local squid_bin
+    squid_bin=$(command -v squid 2>/dev/null || true)
+    if [ -z "$squid_bin" ]; then
+        error_exit "squid binary not found after apt install"
+    fi
+
+    local squid_ver
+    squid_ver=$("$squid_bin" -v 2>&1 | head -1 || true)
+    print_success "Installed: $squid_ver"
+    print_info "Binary: $squid_bin"
+
+    # Point SQUID_PREFIX paths to where apt installed things
+    # apt installs to /usr/sbin/squid, libexec at /usr/lib/squid
+    SQUID_PREFIX="/usr"
+    SQUID_LIBEXEC="/usr/lib/squid"
+
     echo ""
-}
-
-validate_pinned_release() {
-    if [ -z "$SQUID_SERIES" ] || [ -z "$SQUID_VERSION" ] || [ -z "$SQUID_TARBALL_EXT" ]; then
-        error_exit "Invalid Squid pin configuration"
-    fi
-
-    local test_url
-    test_url="https://www.squid-cache.org/Versions/${SQUID_SERIES}/squid-${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
-
-    if ! curl -fsI "$test_url" > /dev/null; then
-        error_exit "Pinned Squid tarball not found: $test_url"
-    fi
 }
 
 build_squid() {
     print_separator
     echo -e "${BOLD}Building Squid from source...${NC}"
     echo ""
+
+    # Extra build deps not needed for apt path
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        build-essential pkg-config perl m4 \
+        libssl-dev libexpat1-dev libxml2-dev \
+        zlib1g-dev libcppunit-dev libecap3-dev \
+        libdb-dev libsasl2-dev libldap2-dev libpam0g-dev \
+        xz-utils tar
 
     validate_pinned_release
     print_info "Using pinned Squid release: $SQUID_VERSION ($SQUID_SERIES, tar.$SQUID_TARBALL_EXT)"
@@ -496,8 +525,104 @@ build_squid() {
         exit 1
     }
 
+    SQUID_LIBEXEC="$SQUID_PREFIX/libexec"
     print_success "Installed Squid ${SQUID_VERSION} at ${SQUID_PREFIX}"
     echo ""
+}
+
+stop_old_squid() {
+    print_separator
+    echo -e "${BOLD}Stopping old proxy services...${NC}"
+    echo ""
+
+    systemctl stop squid > /dev/null 2>&1 || true
+    systemctl disable squid > /dev/null 2>&1 || true
+    pkill -9 squid > /dev/null 2>&1 || true
+
+    print_success "Old squid processes stopped"
+    echo ""
+}
+
+configure_dns() {
+    print_separator
+    echo -e "${BOLD}Configuring public DNS (1.1.1.1 / 8.8.8.8)...${NC}"
+    echo ""
+
+    local dns1="1.1.1.1"
+    local dns2="8.8.8.8"
+    local dns3="8.8.4.4"
+    local configured=0
+
+    # Try systemd-resolved first
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        local resolved_conf="/etc/systemd/resolved.conf.d/squid-proxy-dns.conf"
+        mkdir -p "$(dirname "$resolved_conf")"
+        cat > "$resolved_conf" <<EOF
+[Resolve]
+DNS=$dns1 $dns2 $dns3
+FallbackDNS=
+DNSStubListener=yes
+EOF
+        systemctl restart systemd-resolved
+        print_success "systemd-resolved configured with $dns1 $dns2 $dns3"
+        configured=1
+    fi
+
+    # Also write /etc/resolv.conf directly (works regardless of resolved)
+    local resolv_conf="/etc/resolv.conf"
+    # If it's a symlink managed by systemd-resolved, update /etc/resolv.conf via resolvectl
+    if [ -L "$resolv_conf" ] && [ "$configured" -eq 1 ]; then
+        # resolved will regenerate the stub; verify DNS shows our servers
+        if resolvectl dns 2>/dev/null | grep -q "$dns1"; then
+            print_success "/etc/resolv.conf managed by systemd-resolved (stub active)"
+        else
+            print_warning "systemd-resolved active but $dns1 not visible in resolvectl dns output"
+        fi
+    else
+        # Either not a symlink or resolved not running — write directly
+        # Back up only if not already our version
+        if ! grep -q "# squid-proxy-dns" "$resolv_conf" 2>/dev/null; then
+            cp "$resolv_conf" "${resolv_conf}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        fi
+        cat > "$resolv_conf" <<EOF
+# squid-proxy-dns — managed by proxy-squid-v4.sh
+nameserver $dns1
+nameserver $dns2
+nameserver $dns3
+options timeout:2 attempts:3
+EOF
+        print_success "/etc/resolv.conf updated with $dns1 $dns2 $dns3"
+        configured=1
+    fi
+
+    # Quick sanity check
+    if getent hosts cloudflare.com > /dev/null 2>&1; then
+        print_success "DNS resolution test passed (cloudflare.com)"
+    else
+        print_warning "DNS resolution test failed — check /etc/resolv.conf and network"
+    fi
+
+    echo ""
+}
+
+validate_pinned_release() {
+    if [ -z "$SQUID_SERIES" ] || [ -z "$SQUID_VERSION" ] || [ -z "$SQUID_TARBALL_EXT" ]; then
+        error_exit "Invalid Squid pin configuration"
+    fi
+
+    local test_url
+    test_url="https://www.squid-cache.org/Versions/${SQUID_SERIES}/squid-${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+
+    if ! curl -fsI "$test_url" > /dev/null; then
+        error_exit "Pinned Squid tarball not found: $test_url"
+    fi
+}
+
+# PLACEHOLDER — replaced below; kept so validate_pinned_release reference is intact
+_build_squid_unused() {
+    # This function is intentionally empty; build_squid() inside install_squid_apt
+    # block handles source builds for older distros.
+    :
 }
 
 prepare_runtime() {
@@ -554,7 +679,7 @@ pid_filename /run/squid/squid.pid
 coredump_dir $SQUID_SPOOL_DIR
 
 # Authentication
-auth_param basic program $SQUID_PREFIX/libexec/basic_ncsa_auth $SQUID_PASSWD_FILE
+auth_param basic program $SQUID_LIBEXEC/basic_ncsa_auth $SQUID_PASSWD_FILE
 auth_param basic children $AUTH_CHILDREN
 auth_param basic realm ForumCheckerProxy
 auth_param basic credentialsttl 24 hours
@@ -592,6 +717,11 @@ memory_pools off
 access_log none
 cache_store_log none
 cache_log $SQUID_LOG_DIR/cache.log
+
+# DNS — use public resolvers directly (VPS DNS can be slow under high load)
+dns_nameservers 1.1.1.1 8.8.8.8 8.8.4.4
+dns_timeout 10 seconds
+negative_ttl 1 minute
 
 # Connection behavior tuned for forward proxy stability
 connect_timeout 15 seconds
@@ -859,8 +989,19 @@ main() {
     run_step "get_user_input" get_user_input
     run_step "setup_swap" setup_swap
     run_step "install_prerequisites" install_prerequisites
+    run_step "configure_dns" configure_dns
     run_step "stop_old_squid" stop_old_squid
-    run_step "build_squid" build_squid
+
+    # Ubuntu 24.04+: use apt (Squid 6 available, no compile needed — ~2 min)
+    # Older distros: fall back to source build (~10-15 min on 1 vCPU)
+    if can_use_apt_squid6; then
+        print_info "Ubuntu 24.04+ detected — using apt to install Squid 6 (fast path)"
+        run_step "install_squid_apt" install_squid_apt
+    else
+        print_info "Older distro detected — building Squid from source"
+        run_step "build_squid" build_squid
+    fi
+
     run_step "prepare_runtime" prepare_runtime
     run_step "write_squid_config" write_squid_config
     run_step "write_sysctl_profile" write_sysctl_profile

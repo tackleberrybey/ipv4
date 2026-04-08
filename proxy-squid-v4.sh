@@ -422,7 +422,7 @@ install_prerequisites() {
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         apache2-utils ca-certificates curl \
-        ufw conntrack
+        ufw conntrack libjemalloc2
 
     print_success "Base prerequisites installed"
     echo ""
@@ -709,9 +709,11 @@ reply_header_access X-Cache-Lookup deny all
 
 # No caching (checker workload)
 cache deny all
-cache_mem 16 MB
+cache_mem 0 MB
 maximum_object_size 0 KB
-memory_pools off
+# memory_pools left at default (on) — with jemalloc, Squid's internal pools
+# are managed efficiently; turning them off causes glibc heap fragmentation
+# per Squid docs: https://wiki.squid-cache.org/SquidFaq/SquidMemory
 
 # Logs — access log disabled (high-volume checker workload; errors go to cache.log)
 access_log none
@@ -785,10 +787,39 @@ EOF
     echo ""
 }
 
+find_jemalloc_so() {
+    # Try common paths in order; return first match
+    local candidates=(
+        /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+        /usr/lib/aarch64-linux-gnu/libjemalloc.so.2
+        /usr/lib/libjemalloc.so.2
+        /usr/local/lib/libjemalloc.so.2
+    )
+    for p in "${candidates[@]}"; do
+        if [ -f "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    # Last resort: ldconfig
+    ldconfig -p 2>/dev/null | grep libjemalloc | awk '{print $NF}' | head -1
+}
+
 write_systemd_unit() {
     print_separator
     echo -e "${BOLD}Creating systemd unit...${NC}"
     echo ""
+
+    local jemalloc_so
+    jemalloc_so=$(find_jemalloc_so)
+
+    local ld_preload_line=""
+    if [ -n "$jemalloc_so" ]; then
+        ld_preload_line="Environment=LD_PRELOAD=$jemalloc_so"
+        print_success "jemalloc found: $jemalloc_so"
+    else
+        print_warning "libjemalloc2 not found — Squid will use default glibc malloc (memory may grow unbounded)"
+    fi
 
     cat > /etc/systemd/system/squid.service <<EOF
 [Unit]
@@ -803,6 +834,7 @@ Group=proxy
 PIDFile=/run/squid/squid.pid
 RuntimeDirectory=squid
 RuntimeDirectoryMode=0755
+${ld_preload_line}
 ExecStartPre=$SQUID_PREFIX/sbin/squid -k parse -f $SQUID_ETC_DIR/squid.conf
 ExecStart=$SQUID_PREFIX/sbin/squid -f $SQUID_ETC_DIR/squid.conf
 ExecReload=$SQUID_PREFIX/sbin/squid -k reconfigure -f $SQUID_ETC_DIR/squid.conf
@@ -879,6 +911,17 @@ start_and_validate() {
         print_success "No assertion detected in startup logs"
     fi
 
+    # Verify jemalloc is loaded
+    local squid_pid
+    squid_pid=$(pgrep -f "squid-1" | head -1 || true)
+    if [ -n "$squid_pid" ]; then
+        if grep -q "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null; then
+            print_success "jemalloc confirmed loaded in squid-1 process"
+        else
+            print_warning "jemalloc NOT detected in squid-1 maps — glibc malloc in use (memory may grow unbounded)"
+        fi
+    fi
+
     echo ""
 }
 
@@ -896,6 +939,18 @@ systemctl is-active squid || true
 echo ""
 echo "Workers:"
 ps -eo pid,ppid,%cpu,%mem,rss,etime,cmd | grep '[s]quid' || true
+echo ""
+echo "jemalloc:"
+SQUID_PID=$(pgrep -f "squid-1" | head -1 || true)
+if [ -n "$SQUID_PID" ]; then
+    if grep -q "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null; then
+        echo "  [OK] jemalloc loaded in squid-1 (PID=$SQUID_PID)"
+    else
+        echo "  [WARN] jemalloc NOT loaded — glibc malloc in use (memory may grow unbounded)"
+    fi
+else
+    echo "  squid-1 process not found"
+fi
 echo ""
 echo "Socket states on :$PORT"
 ss -ant "( sport = :$PORT or dport = :$PORT )" | awk 'NR>1{c[$1]++} END{for (s in c) print s, c[s]}'

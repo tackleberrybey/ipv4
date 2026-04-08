@@ -946,9 +946,6 @@ start_and_validate() {
     else
         print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
     fi
-    else
-        print_warning "squid-1 child process not found after 10s — could not verify jemalloc"
-    fi
 
     echo ""
 }

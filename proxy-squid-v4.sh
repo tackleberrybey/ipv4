@@ -715,6 +715,12 @@ maximum_object_size 0 KB
 # are managed efficiently; turning them off causes glibc heap fragmentation
 # per Squid docs: https://wiki.squid-cache.org/SquidFaq/SquidMemory
 
+# Disable cache digest (no caching = no digest needed; avoids CPU burn)
+digest_generation off
+
+# Disable pinger (ICMP ping helper — not needed for forward proxy)
+pinger_enable off
+
 # Logs — access log disabled (high-volume checker workload; errors go to cache.log)
 access_log none
 cache_store_log none
@@ -788,8 +794,18 @@ EOF
 }
 
 find_jemalloc_so() {
-    # Try common paths in order; return first match
+    # ldconfig is the authoritative source — use it first
+    local ldconfig_path
+    ldconfig_path=$(ldconfig -p 2>/dev/null | grep "libjemalloc\.so\.2" | awk '{print $NF}' | head -1)
+    if [ -n "$ldconfig_path" ] && [ -f "$ldconfig_path" ]; then
+        echo "$ldconfig_path"
+        return 0
+    fi
+
+    # Fallback: try common paths in order
     local candidates=(
+        /lib/x86_64-linux-gnu/libjemalloc.so.2
+        /lib/aarch64-linux-gnu/libjemalloc.so.2
         /usr/lib/x86_64-linux-gnu/libjemalloc.so.2
         /usr/lib/aarch64-linux-gnu/libjemalloc.so.2
         /usr/lib/libjemalloc.so.2
@@ -801,8 +817,6 @@ find_jemalloc_so() {
             return 0
         fi
     done
-    # Last resort: ldconfig
-    ldconfig -p 2>/dev/null | grep libjemalloc | awk '{print $NF}' | head -1
 }
 
 write_systemd_unit() {

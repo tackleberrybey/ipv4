@@ -930,7 +930,9 @@ start_and_validate() {
     squid_pid=$(pgrep -f "squid-1" | head -1 || true)
     if [ -n "$squid_pid" ]; then
         if grep -q "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null; then
-            print_success "jemalloc confirmed loaded in squid-1 process"
+            local jemalloc_path
+            jemalloc_path=$(grep "libjemalloc" /proc/"$squid_pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
+            print_success "jemalloc confirmed loaded in squid-1 process ($jemalloc_path)"
         else
             print_warning "jemalloc NOT detected in squid-1 maps — glibc malloc in use (memory may grow unbounded)"
         fi
@@ -958,7 +960,8 @@ echo "jemalloc:"
 SQUID_PID=$(pgrep -f "squid-1" | head -1 || true)
 if [ -n "$SQUID_PID" ]; then
     if grep -q "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null; then
-        echo "  [OK] jemalloc loaded in squid-1 (PID=$SQUID_PID)"
+        JEMALLOC_PATH=$(grep "libjemalloc" /proc/"$SQUID_PID"/maps 2>/dev/null | awk '{print $NF}' | head -1)
+        echo "  [OK] jemalloc loaded in squid-1 (PID=$SQUID_PID, path=$JEMALLOC_PATH)"
     else
         echo "  [WARN] jemalloc NOT loaded — glibc malloc in use (memory may grow unbounded)"
     fi

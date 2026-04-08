@@ -41,7 +41,7 @@ HTTP_PORT="${HTTP_PORT:-$DEFAULT_PORT}"
 SQUID_WORKERS="1"
 RECOMMENDED_CONCURRENCY="80"
 BUILD_JOBS="1"
-AUTH_CHILDREN="8 startup=2 idle=1"
+AUTH_CHILDREN="20 startup=10 idle=5"
 SQUID_VERSION="${SQUID_VERSION:-$DEFAULT_SQUID_VERSION}"
 SQUID_SERIES="${SQUID_SERIES:-$DEFAULT_SQUID_SERIES}"
 SQUID_TARBALL_EXT="${SQUID_TARBALL_EXT:-$DEFAULT_SQUID_TARBALL_EXT}"
@@ -250,7 +250,7 @@ choose_capacity_defaults() {
         SQUID_WORKERS=1
         RECOMMENDED_CONCURRENCY=80
         BUILD_JOBS=1
-        AUTH_CHILDREN="8 startup=2 idle=1"
+        AUTH_CHILDREN="20 startup=10 idle=5"
     elif [ "$total_ram_mb" -le 2048 ]; then
         SQUID_WORKERS=2
         RECOMMENDED_CONCURRENCY=150
@@ -588,19 +588,18 @@ cache_mem 16 MB
 maximum_object_size 0 KB
 memory_pools off
 
-# Logs — only errors (avoids disk fill on high-volume checker workload)
-logformat squid_errors %ts.%03tu %6tr %>a %Ss/%03>Hs %<st %rm %ru
-access_log $SQUID_LOG_DIR/errors.log squid_errors ERR_
+# Logs — access log disabled (high-volume checker workload; errors go to cache.log)
+access_log none
 cache_store_log none
 cache_log $SQUID_LOG_DIR/cache.log
 
 # Connection behavior tuned for forward proxy stability
-connect_timeout 20 seconds
+connect_timeout 15 seconds
 read_timeout 45 seconds
 request_timeout 45 seconds
-client_idle_pconn_timeout 20 seconds
-pconn_timeout 10 seconds
-forward_timeout 30 seconds
+client_idle_pconn_timeout 15 seconds
+pconn_timeout 8 seconds
+forward_timeout 15 seconds
 shutdown_lifetime 3 seconds
 
 # Important stability defaults (v3 bugfix)
@@ -626,7 +625,7 @@ fs.file-max = 2097152
 net.ipv4.ip_local_port_range = 1024 65535
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10

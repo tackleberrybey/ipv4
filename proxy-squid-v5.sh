@@ -3,18 +3,19 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.2.0
+# Squid Forward Proxy Setup Script v4.3.0
 # Stable + apt-based install for Ubuntu 24.04
 #
-# Key fixes vs v4.1:
+# Key fixes vs v4.2:
 # - Ubuntu 24.04: installs Squid 6 via apt (no compile, ~2 min vs 15 min)
 # - Older Ubuntu/Debian: falls back to source compile
 # - Configures public DNS (1.1.1.1 8.8.8.8) via systemd-resolved or
 #   /etc/resolv.conf for reliable forum hostname resolution
 # - dns_nameservers directive in squid.conf
 # - half_closed_clients OFF (default, safer for forward proxy)
+# - client/server persistent connections OFF for checker-only workload
 # - pipeline_prefetch OFF (avoid risky connection behavior)
-# - Adds assert/crash smoke checks after startup
+# - Adds worker abort/crash smoke checks after startup
 #############################################
 
 RED='\033[0;31m'
@@ -26,7 +27,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.2.0"
+SCRIPT_REV="v4.3.0"
 DEFAULT_SQUID_SERIES="v6"
 DEFAULT_SQUID_VERSION="6.12"
 DEFAULT_SQUID_TARBALL_EXT="xz"
@@ -51,6 +52,7 @@ SQUID_SERIES="${SQUID_SERIES:-$DEFAULT_SQUID_SERIES}"
 SQUID_TARBALL_EXT="${SQUID_TARBALL_EXT:-$DEFAULT_SQUID_TARBALL_EXT}"
 AUTO_YES="${AUTO_YES:-0}"
 TARGET_NF_CONNTRACK_MAX="262144"
+ACTUAL_SQUID_VERSION=""
 
 if [ -t 0 ] && [ -t 1 ]; then
     INTERACTIVE=1
@@ -437,6 +439,7 @@ install_squid_apt() {
 
     local squid_ver
     squid_ver=$("$squid_bin" -v 2>&1 | head -1 || true)
+    ACTUAL_SQUID_VERSION="$squid_ver"
     print_success "Installed: $squid_ver"
     print_info "Binary: $squid_bin"
 
@@ -506,6 +509,7 @@ build_squid() {
     }
 
     SQUID_LIBEXEC="$SQUID_PREFIX/libexec"
+    ACTUAL_SQUID_VERSION=$("$SQUID_PREFIX/sbin/squid" -v 2>&1 | head -1 || true)
     print_success "Installed Squid ${SQUID_VERSION} at ${SQUID_PREFIX}"
     echo ""
 }
@@ -674,8 +678,9 @@ http_access allow CONNECT authenticated
 http_access allow authenticated
 http_access deny all
 
-# Privacy / anonymity
-via off
+# Minimize forwarded client headers. We keep Via enabled because Squid warns
+# that HTTP proxies are expected to send it, and the checker does not rely on
+# anonymous/elite proxy behavior.
 forwarded_for delete
 request_header_access X-Forwarded-For deny all
 request_header_access Via deny all
@@ -719,6 +724,8 @@ client_idle_pconn_timeout 15 seconds
 pconn_timeout 8 seconds
 forward_timeout 15 seconds
 shutdown_lifetime 3 seconds
+client_persistent_connections off
+server_persistent_connections off
 
 # Important stability defaults (v3 bugfix)
 half_closed_clients off
@@ -834,6 +841,7 @@ ExecStart=$SQUID_PREFIX/sbin/squid -f $SQUID_ETC_DIR/squid.conf
 ExecReload=$SQUID_PREFIX/sbin/squid -k reconfigure -f $SQUID_ETC_DIR/squid.conf
 ExecStop=$SQUID_PREFIX/sbin/squid -k shutdown -f $SQUID_ETC_DIR/squid.conf
 LimitNOFILE=100000
+LimitCORE=infinity
 Restart=on-failure
 RestartSec=2
 
@@ -898,11 +906,13 @@ start_and_validate() {
         print_success "Proxy test passed $ok/5"
     fi
 
-    # Quick assert smoke check
-    if journalctl -u squid -n 200 --no-pager | grep -q "assertion failed"; then
-        print_warning "Assertion detected in startup logs. Check: journalctl -u squid -n 300"
+    local recent_logs
+    recent_logs=$(journalctl -u squid --since "-5 minutes" --no-pager 2>/dev/null || true)
+
+    if printf '%s\n' "$recent_logs" | grep -Eq "assertion failed|FATAL:|Segmentation|signal 6|will not be restarted"; then
+        print_warning "Crash markers detected in recent squid logs. Check: journalctl -u squid -n 300"
     else
-        print_success "No assertion detected in startup logs"
+        print_success "No crash markers detected in recent squid logs"
     fi
 
     # Verify jemalloc is loaded
@@ -944,6 +954,9 @@ echo ""
 echo "Workers:"
 ps -eo pid,ppid,%cpu,%mem,rss,etime,cmd | grep '[s]quid' || true
 echo ""
+echo "Recent worker exits (last 30m):"
+journalctl -u squid --since "30 minutes ago" --no-pager 2>/dev/null | grep -E "signal 6|Segmentation|assertion failed|FATAL:|process .* started" | tail -20 || echo "  none"
+echo ""
 echo "jemalloc:"
 JEMALLOC_OK=0
 for PID in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
@@ -960,6 +973,14 @@ fi
 echo ""
 echo "Socket states on :$PORT"
 ss -ant "( sport = :$PORT or dport = :$PORT )" | awk 'NR>1{c[$1]++} END{for (s in c) print s, c[s]}'
+echo ""
+echo "Close-wait pressure:"
+CLOSE_WAIT=$(ss -ant "( sport = :$PORT or dport = :$PORT )" | awk 'NR>1 && $1=="CLOSE-WAIT"{n++} END{print n+0}')
+ESTAB=$(ss -ant "( sport = :$PORT or dport = :$PORT )" | awk 'NR>1 && $1=="ESTAB"{n++} END{print n+0}')
+echo "  estab=$ESTAB close_wait=$CLOSE_WAIT"
+if [ "$CLOSE_WAIT" -gt 200 ]; then
+    echo "  [WARN] CLOSE-WAIT is high — Squid is not closing sockets cleanly"
+fi
 echo ""
 echo "Kernel conntrack:"
 COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
@@ -981,7 +1002,10 @@ echo "Squid error/warn count (last 1h):"
 journalctl -u squid --since "1 hour ago" --no-pager 2>/dev/null | grep -cE "ERR|WARN|assert" || echo "  0"
 echo ""
 echo "Recent squid assertions:"
-journalctl -u squid -n 200 --no-pager | grep -E "assertion failed|will not be restarted" || echo "  none"
+journalctl -u squid -n 200 --no-pager | grep -E "assertion failed|will not be restarted|signal 6|Segmentation|FATAL:" || echo "  none"
+echo ""
+echo "Latest systemd coredump for squid:"
+coredumpctl --no-pager --no-legend list squid 2>/dev/null | tail -1 || echo "  none"
 echo ""
 echo "Error log tail (last 20 lines):"
 tail -n 20 /var/log/squid/errors.log 2>/dev/null || echo "  (no errors.log yet)"
@@ -998,7 +1022,7 @@ save_details() {
 Squid Forward Proxy ${SCRIPT_REV}
 ========================
 
-Squid version: $SQUID_VERSION
+Squid version: ${ACTUAL_SQUID_VERSION:-$SQUID_VERSION}
 Server IP    : $SERVER_IP
 Port         : $HTTP_PORT
 Username     : $PROXY_USER
@@ -1009,8 +1033,10 @@ http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT
 
 Stability profile:
 - half_closed_clients off
+- client_persistent_connections off
+- server_persistent_connections off
 - pipeline_prefetch off
-- no hardcoded public DNS
+- public DNS forced: 1.1.1.1 8.8.8.8 8.8.4.4
 
 Recommended checker settings:
 - concurrency: $RECOMMENDED_CONCURRENCY
@@ -1037,7 +1063,7 @@ display_results() {
     echo "Connection: http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT"
     echo "Username     : $PROXY_USER"
     echo "Password     : $PROXY_PASS"
-    echo "Squid version: $SQUID_VERSION"
+    echo "Squid version: ${ACTUAL_SQUID_VERSION:-$SQUID_VERSION}"
     echo "Monitor script: /root/monitor_squid_v4.sh"
     echo "Details file : /root/proxy_details.txt"
     echo ""

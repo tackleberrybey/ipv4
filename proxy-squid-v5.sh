@@ -194,6 +194,29 @@ prompt_read_silent() {
     fi
 }
 
+generate_hex_token() {
+    local bytes="$1"
+
+    if command -v openssl > /dev/null 2>&1; then
+        openssl rand -hex "$bytes"
+        return 0
+    fi
+
+    od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+}
+
+ensure_proxy_credentials() {
+    if [ -z "$PROXY_USER" ]; then
+        PROXY_USER="u$(generate_hex_token 4)"
+        print_info "Generated proxy username automatically"
+    fi
+
+    if [ -z "$PROXY_PASS" ]; then
+        PROXY_PASS="$(generate_hex_token 24)"
+        print_info "Generated strong proxy password automatically"
+    fi
+}
+
 check_root() {
     if [ "${EUID}" -ne 0 ]; then
         error_exit "This script must be run as root. Use: sudo bash $0"
@@ -284,50 +307,7 @@ get_user_input() {
     echo -e "${BOLD}Configuration${NC}"
     echo ""
 
-    if [ -z "$PROXY_USER" ]; then
-        if [ "$INTERACTIVE" -eq 1 ]; then
-            while true; do
-                if ! prompt_read "Proxy username: " PROXY_USER; then
-                    error_exit "Input stream closed while reading username"
-                fi
-                [ -n "$PROXY_USER" ] && break
-                print_error "Username cannot be empty"
-            done
-        else
-            error_exit "PROXY_USER is required in non-interactive mode"
-        fi
-    fi
-
-    if [ -z "$PROXY_PASS" ]; then
-        if [ "$INTERACTIVE" -eq 1 ]; then
-            while true; do
-                if ! prompt_read_silent "Proxy password: " PROXY_PASS; then
-                    echo ""
-                    error_exit "Input stream closed while reading password"
-                fi
-                echo ""
-                if [ -z "$PROXY_PASS" ]; then
-                    print_error "Password cannot be empty"
-                    continue
-                fi
-
-                local proxy_pass_confirm
-                if ! prompt_read_silent "Confirm password: " proxy_pass_confirm; then
-                    echo ""
-                    error_exit "Input stream closed while confirming password"
-                fi
-                echo ""
-
-                if [ "$PROXY_PASS" != "$proxy_pass_confirm" ]; then
-                    print_error "Passwords do not match"
-                else
-                    break
-                fi
-            done
-        else
-            error_exit "PROXY_PASS is required in non-interactive mode"
-        fi
-    fi
+    ensure_proxy_credentials
 
     if ! [[ "$HTTP_PORT" =~ ^[0-9]+$ ]] || [ "$HTTP_PORT" -lt 1024 ] || [ "$HTTP_PORT" -gt 65535 ]; then
         if [ "$INTERACTIVE" -eq 1 ]; then
@@ -351,7 +331,7 @@ get_user_input() {
     echo ""
     echo "  Server IP              : $SERVER_IP"
     echo "  Username               : $PROXY_USER"
-    echo "  Password               : ${PROXY_PASS//?/*}"
+    echo "  Password               : auto-generated"
     echo "  Port                   : $HTTP_PORT"
     echo "  Squid workers          : $SQUID_WORKERS"
     echo "  Auth children          : $AUTH_CHILDREN"
@@ -421,7 +401,7 @@ install_prerequisites() {
 
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        apache2-utils ca-certificates curl \
+        apache2-utils ca-certificates curl openssl \
         ufw conntrack libjemalloc2
 
     print_success "Base prerequisites installed"
@@ -1055,6 +1035,8 @@ display_results() {
     print_separator
     echo ""
     echo "Connection: http://$PROXY_USER:$PROXY_PASS@$SERVER_IP:$HTTP_PORT"
+    echo "Username     : $PROXY_USER"
+    echo "Password     : $PROXY_PASS"
     echo "Squid version: $SQUID_VERSION"
     echo "Monitor script: /root/monitor_squid_v4.sh"
     echo "Details file : /root/proxy_details.txt"

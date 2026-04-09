@@ -959,8 +959,25 @@ start_and_validate() {
     local version_output
     version_output=$($SQUID_PREFIX/sbin/squid -v 2>&1 | head -1 || true)
     ACTUAL_SQUID_VERSION="$version_output"
-    if ! printf '%s\n' "$version_output" | grep -q "Version ${SQUID_VERSION}"; then
-        error_exit "Unexpected Squid version after startup: ${version_output:-unknown}"
+
+    local expected_primary="Version ${SQUID_VERSION}"
+    local expected_alt=""
+    if [ "$SQUID_SERIES" = "v7" ] && [[ "$SQUID_VERSION" == *-* ]]; then
+        # Snapshot tarballs are pinned with a date/hash suffix, but the built
+        # binary may report the upstream VCS version string.
+        expected_alt="Version ${SQUID_VERSION%%-*}-VCS"
+    fi
+
+    if printf '%s\n' "$version_output" | grep -Fq "$expected_primary"; then
+        :
+    elif [ -n "$expected_alt" ] && printf '%s\n' "$version_output" | grep -Fq "$expected_alt"; then
+        print_info "Version check matched snapshot form: $expected_alt"
+    else
+        if [ -n "$expected_alt" ]; then
+            error_exit "Unexpected Squid version after startup: ${version_output:-unknown} (expected '$expected_primary' or '$expected_alt')"
+        else
+            error_exit "Unexpected Squid version after startup: ${version_output:-unknown} (expected '$expected_primary')"
+        fi
     fi
 
     print_success "Squid is running"

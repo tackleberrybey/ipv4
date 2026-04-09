@@ -3,10 +3,12 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.4.1
+# Squid Forward Proxy Setup Script v4.4.2
 # Source-built pinned Squid v7 snapshot for Ubuntu/Debian
 #
-# Key fixes vs v4.4.0:
+# Key fixes vs v4.4.1:
+# - Source directory is auto-detected from the downloaded tarball
+#   (handles VCS snapshots like squid-7.0.0-VCS)
 # - Default install path uses a real downloadable Squid v7 snapshot
 # - Release validation now rejects HTML redirects/missing tarballs
 # - jemalloc is disabled by default (opt-in via ENABLE_JEMALLOC=1)
@@ -29,7 +31,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.4.1"
+SCRIPT_REV="v4.4.2"
 DEFAULT_SQUID_SERIES="v7"
 DEFAULT_SQUID_VERSION="7.0.0-20250103-rb56774dd09"
 DEFAULT_SQUID_TARBALL_EXT="gz"
@@ -492,8 +494,28 @@ build_squid() {
     curl -fsSL "$url" -o "$SQUID_SRC_DIR/$tarball"
     print_success "Done"
 
+    local source_root=""
+    while IFS= read -r archive_entry; do
+        archive_entry="${archive_entry#./}"
+        archive_entry="${archive_entry%%/*}"
+
+        if [ -n "$archive_entry" ] && [ "$archive_entry" != "." ]; then
+            source_root="$archive_entry"
+            break
+        fi
+    done < <(tar -tf "$SQUID_SRC_DIR/$tarball" 2>/dev/null)
+    if [ -z "$source_root" ]; then
+        error_exit "Could not detect source directory in $tarball"
+    fi
+
     tar -xf "$SQUID_SRC_DIR/$tarball" -C "$SQUID_SRC_DIR"
-    cd "$SQUID_SRC_DIR/squid-${SQUID_VERSION}"
+
+    if [ ! -d "$SQUID_SRC_DIR/$source_root" ]; then
+        error_exit "Expected extracted source dir not found: $SQUID_SRC_DIR/$source_root"
+    fi
+
+    print_info "Detected source directory: $source_root"
+    cd "$SQUID_SRC_DIR/$source_root"
 
     echo -n "Configuring build... "
     run_logged_command "Configuring build" "/tmp/squid-configure.log" ./configure \

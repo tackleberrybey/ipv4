@@ -494,28 +494,25 @@ build_squid() {
     curl -fsSL "$url" -o "$SQUID_SRC_DIR/$tarball"
     print_success "Done"
 
-    local source_root=""
-    while IFS= read -r archive_entry; do
-        archive_entry="${archive_entry#./}"
-        archive_entry="${archive_entry%%/*}"
+    local source_dir="$SQUID_SRC_DIR/source"
+    rm -rf "$source_dir"
+    mkdir -p "$source_dir"
 
-        if [ -n "$archive_entry" ] && [ "$archive_entry" != "." ]; then
-            source_root="$archive_entry"
-            break
-        fi
-    done < <(tar -tf "$SQUID_SRC_DIR/$tarball" 2>/dev/null)
-    if [ -z "$source_root" ]; then
-        error_exit "Could not detect source directory in $tarball"
+    if ! tar -tf "$SQUID_SRC_DIR/$tarball" > /dev/null 2>&1; then
+        error_exit "Downloaded archive appears invalid: $SQUID_SRC_DIR/$tarball"
     fi
 
-    tar -xf "$SQUID_SRC_DIR/$tarball" -C "$SQUID_SRC_DIR"
+    # Squid snapshots may extract to non-versioned top-level dirs
+    # (e.g. squid-7.0.0-VCS). Strip exactly one top component into
+    # a fixed work directory to avoid path detection failures.
+    tar -xf "$SQUID_SRC_DIR/$tarball" -C "$source_dir" --strip-components=1
 
-    if [ ! -d "$SQUID_SRC_DIR/$source_root" ]; then
-        error_exit "Expected extracted source dir not found: $SQUID_SRC_DIR/$source_root"
+    if [ ! -x "$source_dir/configure" ]; then
+        error_exit "Expected configure script not found after extraction: $source_dir/configure"
     fi
 
-    print_info "Detected source directory: $source_root"
-    cd "$SQUID_SRC_DIR/$source_root"
+    print_info "Using source directory: $source_dir"
+    cd "$source_dir"
 
     echo -n "Configuring build... "
     run_logged_command "Configuring build" "/tmp/squid-configure.log" ./configure \

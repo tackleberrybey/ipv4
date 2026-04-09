@@ -3,12 +3,12 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.4.0
-# Stable + source-built Squid 7.5 for Ubuntu/Debian
+# Squid Forward Proxy Setup Script v4.4.1
+# Source-built pinned Squid v7 snapshot for Ubuntu/Debian
 #
-# Key fixes vs v4.3:
-# - Default install path is source-built Squid 7.5
-# - Ubuntu 24.04 apt Squid 6 is no longer the default path
+# Key fixes vs v4.4.0:
+# - Default install path uses a real downloadable Squid v7 snapshot
+# - Release validation now rejects HTML redirects/missing tarballs
 # - jemalloc is disabled by default (opt-in via ENABLE_JEMALLOC=1)
 # - systemd runs a single foreground Squid service without PIDFile coupling
 # - Configures public DNS (1.1.1.1 8.8.8.8) via systemd-resolved or
@@ -29,10 +29,10 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.4.0"
+SCRIPT_REV="v4.4.1"
 DEFAULT_SQUID_SERIES="v7"
-DEFAULT_SQUID_VERSION="7.5"
-DEFAULT_SQUID_TARBALL_EXT="xz"
+DEFAULT_SQUID_VERSION="7.0.0-20250103-rb56774dd09"
+DEFAULT_SQUID_TARBALL_EXT="gz"
 SQUID_PREFIX="/usr/local/squid"
 SQUID_LIBEXEC="/usr/local/squid/libexec"   # overridden only by legacy apt fallback
 SQUID_ETC_DIR="/etc/squid"
@@ -75,7 +75,7 @@ print_header() {
     fi
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo -e "${CYAN}|${NC} ${BOLD}Squid Forward Proxy Setup ${SCRIPT_REV}${NC}             ${CYAN}|${NC}"
-    echo -e "${CYAN}|${NC} Pinned Squid ${SQUID_SERIES}/${SQUID_VERSION} hardening       ${CYAN}|${NC}"
+    echo -e "${CYAN}|${NC} Pinned Squid ${SQUID_SERIES}/${SQUID_VERSION} hardening ${CYAN}|${NC}"
     echo -e "${CYAN}+--------------------------------------------------+${NC}"
     echo ""
 }
@@ -342,6 +342,11 @@ get_user_input() {
     echo "  Auth children          : $AUTH_CHILDREN"
     echo "  Install method         : source compile (~10-15 min)"
     echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+    if [ "$SQUID_SERIES" = "v7" ]; then
+        echo "  Release channel        : v7 snapshot"
+    else
+        echo "  Release channel        : stable"
+    fi
     echo "  Build jobs             : $BUILD_JOBS"
     if [ "$ENABLE_JEMALLOC" = "1" ]; then
         echo "  jemalloc preload       : enabled (opt-in)"
@@ -611,11 +616,35 @@ validate_pinned_release() {
     fi
 
     local test_url
+    local probe_output
+    local effective_url
+    local content_type
+    local http_code
     test_url="https://www.squid-cache.org/Versions/${SQUID_SERIES}/squid-${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
 
-    if ! curl -fsI "$test_url" > /dev/null; then
+    probe_output=$(curl -fsSLI -o /dev/null -w '%{url_effective}\n%{content_type}\n%{http_code}\n' "$test_url") || {
         error_exit "Pinned Squid tarball not found: $test_url"
+    }
+
+    effective_url=$(printf '%s\n' "$probe_output" | sed -n '1p')
+    content_type=$(printf '%s\n' "$probe_output" | sed -n '2p')
+    http_code=$(printf '%s\n' "$probe_output" | sed -n '3p')
+
+    if [ "$http_code" != "200" ]; then
+        error_exit "Pinned Squid tarball returned HTTP $http_code: $test_url"
     fi
+
+    if [ "$effective_url" != "$test_url" ]; then
+        error_exit "Pinned Squid tarball redirected unexpectedly: $effective_url"
+    fi
+
+    case "$content_type" in
+        application/*|binary/*)
+            ;;
+        *)
+            error_exit "Pinned Squid tarball returned unexpected content type '$content_type'"
+            ;;
+    esac
 }
 
 # PLACEHOLDER — replaced below; kept so validate_pinned_release reference is intact

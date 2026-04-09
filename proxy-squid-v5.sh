@@ -3,12 +3,14 @@
 set -euo pipefail
 
 #############################################
-# Squid Forward Proxy Setup Script v4.3.0
-# Stable + apt-based install for Ubuntu 24.04
+# Squid Forward Proxy Setup Script v4.4.0
+# Stable + source-built Squid 7.5 for Ubuntu/Debian
 #
-# Key fixes vs v4.2:
-# - Ubuntu 24.04: installs Squid 6 via apt (no compile, ~2 min vs 15 min)
-# - Older Ubuntu/Debian: falls back to source compile
+# Key fixes vs v4.3:
+# - Default install path is source-built Squid 7.5
+# - Ubuntu 24.04 apt Squid 6 is no longer the default path
+# - jemalloc is disabled by default (opt-in via ENABLE_JEMALLOC=1)
+# - systemd runs a single foreground Squid service without PIDFile coupling
 # - Configures public DNS (1.1.1.1 8.8.8.8) via systemd-resolved or
 #   /etc/resolv.conf for reliable forum hostname resolution
 # - dns_nameservers directive in squid.conf
@@ -27,12 +29,12 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 DEFAULT_PORT=3128
-SCRIPT_REV="v4.3.0"
-DEFAULT_SQUID_SERIES="v6"
-DEFAULT_SQUID_VERSION="6.12"
+SCRIPT_REV="v4.4.0"
+DEFAULT_SQUID_SERIES="v7"
+DEFAULT_SQUID_VERSION="7.5"
 DEFAULT_SQUID_TARBALL_EXT="xz"
 SQUID_PREFIX="/usr/local/squid"
-SQUID_LIBEXEC="/usr/local/squid/libexec"   # overridden by apt path
+SQUID_LIBEXEC="/usr/local/squid/libexec"   # overridden only by legacy apt fallback
 SQUID_ETC_DIR="/etc/squid"
 SQUID_LOG_DIR="/var/log/squid"
 SQUID_SPOOL_DIR="/var/spool/squid"
@@ -50,6 +52,7 @@ AUTH_CHILDREN="20 startup=10 idle=5"
 SQUID_VERSION="${SQUID_VERSION:-$DEFAULT_SQUID_VERSION}"
 SQUID_SERIES="${SQUID_SERIES:-$DEFAULT_SQUID_SERIES}"
 SQUID_TARBALL_EXT="${SQUID_TARBALL_EXT:-$DEFAULT_SQUID_TARBALL_EXT}"
+ENABLE_JEMALLOC="${ENABLE_JEMALLOC:-0}"
 AUTO_YES="${AUTO_YES:-0}"
 TARGET_NF_CONNTRACK_MAX="262144"
 ACTUAL_SQUID_VERSION=""
@@ -337,13 +340,13 @@ get_user_input() {
     echo "  Port                   : $HTTP_PORT"
     echo "  Squid workers          : $SQUID_WORKERS"
     echo "  Auth children          : $AUTH_CHILDREN"
-    if can_use_apt_squid6; then
-        echo "  Install method         : apt (Ubuntu 24.04 fast path, ~2 min)"
-        echo "  Squid version          : 6 (latest from apt)"
+    echo "  Install method         : source compile (~10-15 min)"
+    echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
+    echo "  Build jobs             : $BUILD_JOBS"
+    if [ "$ENABLE_JEMALLOC" = "1" ]; then
+        echo "  jemalloc preload       : enabled (opt-in)"
     else
-        echo "  Install method         : source compile (~10-15 min)"
-        echo "  Pinned Squid release   : ${SQUID_SERIES}/${SQUID_VERSION}.tar.${SQUID_TARBALL_EXT}"
-        echo "  Build jobs             : $BUILD_JOBS"
+        echo "  jemalloc preload       : disabled (default)"
     fi
     echo "  DNS                    : 1.1.1.1 8.8.8.8 8.8.4.4"
     echo "  Recommended concurrency: $RECOMMENDED_CONCURRENCY"
@@ -404,13 +407,20 @@ install_prerequisites() {
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         apache2-utils ca-certificates curl openssl \
-        ufw conntrack libjemalloc2
+        ufw conntrack
+
+    if [ "$ENABLE_JEMALLOC" = "1" ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libjemalloc2
+        print_success "Optional jemalloc package installed"
+    else
+        print_info "Skipping jemalloc package install (default: disabled)"
+    fi
 
     print_success "Base prerequisites installed"
     echo ""
 }
 
-# Returns 0 if we can use apt-based Squid 6 (Ubuntu 24.04+), 1 otherwise
+# Legacy helper kept for manual recovery only; the default path is source build.
 can_use_apt_squid6() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
@@ -425,7 +435,7 @@ can_use_apt_squid6() {
 
 install_squid_apt() {
     print_separator
-    echo -e "${BOLD}Installing Squid 6 via apt (Ubuntu 24.04)...${NC}"
+    echo -e "${BOLD}Installing Squid 6 via apt (legacy fallback)...${NC}"
     echo ""
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq squid
@@ -456,7 +466,7 @@ build_squid() {
     echo -e "${BOLD}Building Squid from source...${NC}"
     echo ""
 
-    # Extra build deps not needed for apt path
+    # Build dependencies for source-installed Squid
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         build-essential pkg-config perl m4 \
         libssl-dev libexpat1-dev libxml2-dev \
@@ -521,7 +531,13 @@ stop_old_squid() {
 
     systemctl stop squid > /dev/null 2>&1 || true
     systemctl disable squid > /dev/null 2>&1 || true
-    pkill -9 squid > /dev/null 2>&1 || true
+    systemctl reset-failed squid > /dev/null 2>&1 || true
+
+    pkill -TERM -x squid > /dev/null 2>&1 || true
+    sleep 2
+    pkill -KILL -x squid > /dev/null 2>&1 || true
+
+    rm -f /run/squid.pid /run/squid/squid.pid
 
     print_success "Old squid processes stopped"
     echo ""
@@ -696,9 +712,8 @@ reply_header_access X-Cache-Lookup deny all
 cache deny all
 cache_mem 0 MB
 maximum_object_size 0 KB
-# memory_pools left at default (on) — with jemalloc, Squid's internal pools
-# are managed efficiently; turning them off causes glibc heap fragmentation
-# per Squid docs: https://wiki.squid-cache.org/SquidFaq/SquidMemory
+# memory_pools left at the Squid default. We avoid changing allocator/pool
+# behavior unless there is a specific, proven need.
 
 # Disable cache digest (no caching = no digest needed; avoids CPU burn)
 digest_generation off
@@ -811,37 +826,40 @@ write_systemd_unit() {
     echo -e "${BOLD}Creating systemd unit...${NC}"
     echo ""
 
-    local jemalloc_so
-    jemalloc_so=$(find_jemalloc_so)
-
     local ld_preload_line=""
-    if [ -n "$jemalloc_so" ]; then
-        ld_preload_line="Environment=LD_PRELOAD=$jemalloc_so"
-        print_success "jemalloc found: $jemalloc_so"
+    if [ "$ENABLE_JEMALLOC" = "1" ]; then
+        local jemalloc_so
+        jemalloc_so=$(find_jemalloc_so)
+        if [ -n "$jemalloc_so" ]; then
+            ld_preload_line="Environment=LD_PRELOAD=$jemalloc_so"
+            print_success "jemalloc enabled: $jemalloc_so"
+        else
+            error_exit "ENABLE_JEMALLOC=1 was requested, but libjemalloc.so.2 was not found"
+        fi
     else
-        print_warning "libjemalloc2 not found — Squid will use default glibc malloc (memory may grow unbounded)"
+        print_info "jemalloc preload disabled; Squid will use the default allocator"
     fi
 
     cat > /etc/systemd/system/squid.service <<EOF
 [Unit]
-Description=Squid Web Proxy Server (custom v4)
+Description=Squid Web Proxy Server (custom v4.4)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=forking
+Type=simple
 User=proxy
 Group=proxy
-PIDFile=/run/squid/squid.pid
 RuntimeDirectory=squid
 RuntimeDirectoryMode=0755
 ${ld_preload_line}
 ExecStartPre=$SQUID_PREFIX/sbin/squid -k parse -f $SQUID_ETC_DIR/squid.conf
-ExecStart=$SQUID_PREFIX/sbin/squid -f $SQUID_ETC_DIR/squid.conf
+ExecStart=$SQUID_PREFIX/sbin/squid -N -f $SQUID_ETC_DIR/squid.conf
 ExecReload=$SQUID_PREFIX/sbin/squid -k reconfigure -f $SQUID_ETC_DIR/squid.conf
-ExecStop=$SQUID_PREFIX/sbin/squid -k shutdown -f $SQUID_ETC_DIR/squid.conf
 LimitNOFILE=100000
 LimitCORE=infinity
+KillMode=mixed
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=2
 
@@ -890,7 +908,15 @@ start_and_validate() {
         error_exit "Squid failed to start"
     fi
 
+    local version_output
+    version_output=$($SQUID_PREFIX/sbin/squid -v 2>&1 | head -1 || true)
+    ACTUAL_SQUID_VERSION="$version_output"
+    if ! printf '%s\n' "$version_output" | grep -q "Version ${SQUID_VERSION}"; then
+        error_exit "Unexpected Squid version after startup: ${version_output:-unknown}"
+    fi
+
     print_success "Squid is running"
+    print_success "Version check passed: $version_output"
 
     local local_url="http://$PROXY_USER:$PROXY_PASS@127.0.0.1:$HTTP_PORT"
     local ok=0
@@ -915,25 +941,27 @@ start_and_validate() {
         print_success "No crash markers detected in recent squid logs"
     fi
 
-    # Verify jemalloc is loaded
-    # Check /proc/PID/maps for every squid-related process
-    local jemalloc_verified=0
-    local wait_i
-    for wait_i in 1 2 3 4 5; do
-        local pid
-        for pid in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
-            if grep -q "libjemalloc" /proc/"$pid"/maps 2>/dev/null; then
-                local jemalloc_path
-                jemalloc_path=$(grep "libjemalloc" /proc/"$pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
-                print_success "jemalloc confirmed loaded (PID=$pid, $jemalloc_path)"
-                jemalloc_verified=1
-                break 2
-            fi
+    if [ "$ENABLE_JEMALLOC" = "1" ]; then
+        local jemalloc_verified=0
+        local wait_i
+        for wait_i in 1 2 3 4 5; do
+            local pid
+            for pid in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
+                if grep -q "libjemalloc" /proc/"$pid"/maps 2>/dev/null; then
+                    local jemalloc_path
+                    jemalloc_path=$(grep "libjemalloc" /proc/"$pid"/maps 2>/dev/null | awk '{print $NF}' | head -1)
+                    print_success "jemalloc confirmed loaded (PID=$pid, $jemalloc_path)"
+                    jemalloc_verified=1
+                    break 2
+                fi
+            done
+            sleep 2
         done
-        sleep 2
-    done
-    if [ "$jemalloc_verified" -eq 0 ]; then
-        print_warning "jemalloc NOT confirmed in any squid process — glibc malloc may be in use"
+        if [ "$jemalloc_verified" -eq 0 ]; then
+            error_exit "ENABLE_JEMALLOC=1 was requested, but jemalloc is not loaded in Squid"
+        fi
+    else
+        print_info "jemalloc validation skipped (default: disabled)"
     fi
 
     echo ""
@@ -945,6 +973,7 @@ create_monitor_script() {
 set -u
 
 PORT="${1:-3128}"
+JEMALLOC_EXPECTED="__ENABLE_JEMALLOC__"
 
 echo "Timestamp: $(date)"
 echo ""
@@ -968,7 +997,11 @@ for PID in $(pgrep -a squid 2>/dev/null | awk '{print $1}' || true); do
     fi
 done
 if [ "$JEMALLOC_OK" -eq 0 ]; then
-    echo "  [WARN] jemalloc NOT loaded in any squid process"
+    if [ "$JEMALLOC_EXPECTED" = "1" ]; then
+        echo "  [WARN] jemalloc NOT loaded in any squid process"
+    else
+        echo "  [INFO] jemalloc disabled by installer configuration"
+    fi
 fi
 echo ""
 echo "Socket states on :$PORT"
@@ -1014,6 +1047,8 @@ echo "Cache log tail (last 10 lines):"
 tail -n 10 /var/log/squid/cache.log 2>/dev/null || true
 EOF
 
+    perl -0pi -e 's/__ENABLE_JEMALLOC__/'"$ENABLE_JEMALLOC"'/g' /root/monitor_squid_v4.sh
+
     chmod +x /root/monitor_squid_v4.sh
 }
 
@@ -1036,6 +1071,7 @@ Stability profile:
 - client_persistent_connections off
 - server_persistent_connections off
 - pipeline_prefetch off
+- jemalloc preload: $( [ "$ENABLE_JEMALLOC" = "1" ] && printf 'enabled (opt-in)' || printf 'disabled (default)' )
 - public DNS forced: 1.1.1.1 8.8.8.8 8.8.4.4
 
 Recommended checker settings:
@@ -1064,6 +1100,11 @@ display_results() {
     echo "Username     : $PROXY_USER"
     echo "Password     : $PROXY_PASS"
     echo "Squid version: ${ACTUAL_SQUID_VERSION:-$SQUID_VERSION}"
+    if [ "$ENABLE_JEMALLOC" = "1" ]; then
+        echo "jemalloc     : enabled (opt-in)"
+    else
+        echo "jemalloc     : disabled (default)"
+    fi
     echo "Monitor script: /root/monitor_squid_v4.sh"
     echo "Details file : /root/proxy_details.txt"
     echo ""
@@ -1081,15 +1122,8 @@ main() {
     run_step "configure_dns" configure_dns
     run_step "stop_old_squid" stop_old_squid
 
-    # Ubuntu 24.04+: use apt (Squid 6 available, no compile needed — ~2 min)
-    # Older distros: fall back to source build (~10-15 min on 1 vCPU)
-    if can_use_apt_squid6; then
-        print_info "Ubuntu 24.04+ detected — using apt to install Squid 6 (fast path)"
-        run_step "install_squid_apt" install_squid_apt
-    else
-        print_info "Older distro detected — building Squid from source"
-        run_step "build_squid" build_squid
-    fi
+    print_info "Building Squid ${SQUID_VERSION} from source"
+    run_step "build_squid" build_squid
 
     run_step "prepare_runtime" prepare_runtime
     run_step "write_squid_config" write_squid_config
